@@ -121,7 +121,7 @@ async fn audio_processor(
             // write_be_i24(&mut buf[i..i + 3], sample);
             BigEndian::write_i24(&mut buf[i..i + 3], sample);
         }
-        core::hint::black_box(buf);
+        core::hint::black_box(&buf);
         defmt::info!(
             "Applied volume (-{}dB) to {} samples in {}us",
             vol,
