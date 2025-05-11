@@ -1022,6 +1022,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
+name = "proc-lut"
+version = "0.1.0"
+dependencies = [
+ "quote",
+]
+
+[[package]]
 name = "proc-macro-error-attr2"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1137,6 +1144,7 @@ dependencies = [
 name = "rp2040-soundcard"
 version = "0.1.0"
 dependencies = [
+ "byteorder",
  "cortex-m",
  "cortex-m-rt",
  "defmt 0.3.100",
@@ -1153,6 +1161,7 @@ dependencies = [
  "embedded-storage",
  "panic-probe",
  "portable-atomic",
+ "proc-lut",
  "static_cell",
 ]
 

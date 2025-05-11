@@ -1,12 +1,15 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::AtomicU8;
+
 use embassy_executor::Spawner;
 use embassy_rp::{
     bind_interrupts,
     peripherals::USB,
     usb::{self, Driver},
 };
+use embassy_time::Instant;
 // use embassy_time::{Duration, Timer};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
@@ -19,6 +22,17 @@ use embassy_usb::{
         speaker::{Speaker, State, Volume},
     },
 };
+
+use byteorder::{BigEndian, ByteOrder};
+use proc_lut::lut_100;
+
+/// Look-up-table for factors from 0-100dB
+const LUT_100DB: [u32; 101] = lut_100!();
+
+/// Maximum USB PCM Packet size
+///
+/// 24bit * 2samples * 96kHz * 1ms
+const MAX_PACKET_SIZE: usize = (3 * 2) * (96000 / 1000);
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) -> ! {
@@ -62,17 +76,19 @@ async fn main(spawner: Spawner) -> ! {
     feedback.wait_connection().await;
     audio_stream.wait_connection().await;
 
-    spawner.must_spawn(audio_processor(audio_stream));
+    static VOLUME: AtomicU8 = AtomicU8::new(0);
+
+    spawner.must_spawn(audio_processor(audio_stream, &VOLUME));
     loop {
         audio_ctrl.changed().await;
         let volume = audio_ctrl.volume(Channel::LeftFront);
         let rate = audio_ctrl.sample_rate_hz();
-        if let Some(Volume::DeciBel(db)) = volume {
-            defmt::info!("Volume is {}dB", db);
-        }
         match volume {
             Some(Volume::Muted) => defmt::info!("Speaker is muted"),
-            Some(Volume::DeciBel(db)) => defmt::info!("Volume is {}dB", db),
+            Some(Volume::DeciBel(db)) => {
+                defmt::info!("Volume is {}dB", db);
+                VOLUME.store(db.abs() as u8, core::sync::atomic::Ordering::Relaxed);
+            }
             None => (),
         }
         defmt::info!("Sample rate is {}", rate);
@@ -82,16 +98,36 @@ async fn main(spawner: Spawner) -> ! {
 }
 
 #[embassy_executor::task]
-async fn audio_processor(mut stream: Stream<'static, Driver<'static, USB>>) -> ! {
+async fn audio_processor(
+    mut stream: Stream<'static, Driver<'static, USB>>,
+    volume: &'static AtomicU8,
+) -> ! {
     stream.wait_connection().await;
-    let mut buf = [0; 576];
+    let mut buf = [0; MAX_PACKET_SIZE];
     loop {
-        match stream.read_packet(&mut buf).await {
-            Ok(_x) => {
-                // defmt::info!("Read {} bytes from endpoint", x);
+        let n = match stream.read_packet(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                defmt::info!("Stream read error: {}", e);
+                continue;
             }
-            Err(e) => defmt::info!("Stream read error: {}", e),
+        };
+        let now = Instant::now();
+        let vol = volume.load(core::sync::atomic::Ordering::Relaxed);
+        for i in (0..n).step_by(3) {
+            // let mut sample = read_be_i24(&buf[i..i + 3]);
+            let mut sample = BigEndian::read_i24(&buf[i..i + 3]);
+            sample /= LUT_100DB[vol as usize] as i32;
+            // write_be_i24(&mut buf[i..i + 3], sample);
+            BigEndian::write_i24(&mut buf[i..i + 3], sample);
         }
+        core::hint::black_box(buf);
+        defmt::info!(
+            "Applied volume (-{}dB) to {} samples in {}us",
+            vol,
+            n / 3,
+            now.elapsed().as_micros()
+        );
     }
 }
 
@@ -106,3 +142,36 @@ fn create_usb_conf() -> Config<'static> {
     conf.manufacturer = Some("RT-CUSTOMZ");
     conf
 }
+
+// #[inline]
+// fn read_be_i24(buf: &[u8]) -> i32 {
+//     let mut bytes = [0; 4];
+//     assert!(buf.len() == 3);
+//     bytes[1..].copy_from_slice(buf);
+//     extend_i24_sign(u32::from_be_bytes(bytes))
+// }
+// #[inline]
+// fn extend_i24_sign(n: u32) -> i32 {
+//     #[allow(clippy::identity_op)]
+//     let shift = (4 - 3) * 4;
+//     (n << shift) as i32 >> shift
+// }
+
+// #[inline]
+// fn write_be_i24(buf: &mut [u8], n: i32) {
+//     assert!(buf.len() == 3);
+//     let out = unextend_i24_sign(n);
+//     unsafe {
+//         let bytes = *(&out.to_be() as *const u32 as *const [u8; 4]);
+//         core::ptr::copy_nonoverlapping(
+//             bytes.as_ptr().offset((4 - 3) as isize),
+//             buf.as_mut_ptr(),
+//             3,
+//         );
+//     }
+// }
+// #[inline]
+// fn unextend_i24_sign(n: i32) -> u32 {
+//     let shift = (4 - 3) * 4;
+//     (n << shift) as u32 >> shift
+// }
