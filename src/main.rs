@@ -5,8 +5,10 @@ use core::sync::atomic::AtomicU8;
 
 use embassy_executor::Spawner;
 use embassy_rp::{
-    bind_interrupts,
-    peripherals::USB,
+    Peri, bind_interrupts,
+    peripherals::{PIO0, USB},
+    pio::Pio,
+    pio_programs::i2s::{PioI2sOut, PioI2sOutProgram},
     usb::{self, Driver},
 };
 use embassy_time::Instant;
@@ -34,13 +36,52 @@ const LUT_100DB: [u32; 101] = lut_100!();
 /// 24bit * 2samples * 96kHz * 1ms
 const MAX_PACKET_SIZE: usize = (3 * 2) * (96000 / 1000);
 
+bind_interrupts!(struct UsbIrqs {
+    USBCTRL_IRQ => usb::InterruptHandler<embassy_rp::peripherals::USB>;
+});
+
+bind_interrupts!(struct PioIrqs {
+    PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
+});
+
+struct I2SPeripherals {
+    bit_clock_pin: Peri<'static, embassy_rp::peripherals::PIN_19>,
+    left_right_clock_pin: Peri<'static, embassy_rp::peripherals::PIN_20>,
+    data_pin: Peri<'static, embassy_rp::peripherals::PIN_21>,
+    dma_channel: Peri<'static, embassy_rp::peripherals::DMA_CH0>,
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) -> ! {
     let p = embassy_rp::init(Default::default());
 
-    bind_interrupts!(struct UsbIrqs {
-        USBCTRL_IRQ => usb::InterruptHandler<embassy_rp::peripherals::USB>;
-    });
+    let mut i2s_peri = I2SPeripherals {
+        bit_clock_pin: p.PIN_19,
+        left_right_clock_pin: p.PIN_20,
+        data_pin: p.PIN_21,
+        dma_channel: p.DMA_CH0,
+    };
+
+    // Setup pio state machine for i2s output
+    let Pio {
+        mut common, sm0, ..
+    } = Pio::new(p.PIO0, PioIrqs);
+
+    let program = PioI2sOutProgram::new(&mut common);
+    let mut i2s = PioI2sOut::new(
+        &mut common,
+        sm0,
+        i2s_peri.dma_channel.reborrow(),
+        i2s_peri.data_pin.reborrow(),
+        i2s_peri.bit_clock_pin.reborrow(),
+        i2s_peri.left_right_clock_pin.reborrow(),
+        96000,
+        24,
+        2,
+        &program,
+    );
+    drop(i2s);
+    drop(common);
 
     static UAC_STATE: StaticCell<State> = StaticCell::new();
 
@@ -78,7 +119,7 @@ async fn main(spawner: Spawner) -> ! {
 
     static VOLUME: AtomicU8 = AtomicU8::new(0);
 
-    spawner.must_spawn(audio_processor(audio_stream, &VOLUME));
+    spawner.must_spawn(audio_processor(audio_stream, &VOLUME, i2s_peri));
     loop {
         audio_ctrl.changed().await;
         let volume = audio_ctrl.volume(Channel::LeftFront);
@@ -101,6 +142,7 @@ async fn main(spawner: Spawner) -> ! {
 async fn audio_processor(
     mut stream: Stream<'static, Driver<'static, USB>>,
     volume: &'static AtomicU8,
+    i2s_peri: I2SPeripherals,
 ) -> ! {
     stream.wait_connection().await;
     let mut buf = [0; MAX_PACKET_SIZE];
@@ -115,10 +157,8 @@ async fn audio_processor(
         let now = Instant::now();
         let vol = volume.load(core::sync::atomic::Ordering::Relaxed);
         for i in (0..n).step_by(3) {
-            // let mut sample = read_be_i24(&buf[i..i + 3]);
             let mut sample = BigEndian::read_i24(&buf[i..i + 3]);
             sample /= LUT_100DB[vol as usize] as i32;
-            // write_be_i24(&mut buf[i..i + 3], sample);
             BigEndian::write_i24(&mut buf[i..i + 3], sample);
         }
         core::hint::black_box(&buf);
@@ -142,6 +182,9 @@ fn create_usb_conf() -> Config<'static> {
     conf.manufacturer = Some("RT-CUSTOMZ");
     conf
 }
+
+// 24bit big endian read and write implementation
+// No performance increase compared to byteorder's implementation (which uses u64/i64 instead of u32/i32)
 
 // #[inline]
 // fn read_be_i24(buf: &[u8]) -> i32 {
