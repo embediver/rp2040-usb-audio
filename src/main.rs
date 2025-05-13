@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::AtomicU8;
+use core::{mem, sync::atomic::AtomicU8};
 
 use embassy_executor::Spawner;
 use embassy_rp::{
@@ -16,6 +16,8 @@ use embassy_time::Instant;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::signal::Signal;
 use embassy_usb::{Builder, Config, class::uac1::speaker::Stream};
 use embassy_usb::{
     UsbDevice,
@@ -49,39 +51,20 @@ struct I2SPeripherals {
     left_right_clock_pin: Peri<'static, embassy_rp::peripherals::PIN_20>,
     data_pin: Peri<'static, embassy_rp::peripherals::PIN_21>,
     dma_channel: Peri<'static, embassy_rp::peripherals::DMA_CH0>,
+    pio0: Peri<'static, embassy_rp::peripherals::PIO0>,
 }
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) -> ! {
     let p = embassy_rp::init(Default::default());
 
-    let mut i2s_peri = I2SPeripherals {
+    let i2s_peri = I2SPeripherals {
         bit_clock_pin: p.PIN_19,
         left_right_clock_pin: p.PIN_20,
         data_pin: p.PIN_21,
         dma_channel: p.DMA_CH0,
+        pio0: p.PIO0,
     };
-
-    // Setup pio state machine for i2s output
-    let Pio {
-        mut common, sm0, ..
-    } = Pio::new(p.PIO0, PioIrqs);
-
-    let program = PioI2sOutProgram::new(&mut common);
-    let mut i2s = PioI2sOut::new(
-        &mut common,
-        sm0,
-        i2s_peri.dma_channel.reborrow(),
-        i2s_peri.data_pin.reborrow(),
-        i2s_peri.bit_clock_pin.reborrow(),
-        i2s_peri.left_right_clock_pin.reborrow(),
-        96000,
-        24,
-        2,
-        &program,
-    );
-    drop(i2s);
-    drop(common);
 
     static UAC_STATE: StaticCell<State> = StaticCell::new();
 
@@ -118,8 +101,16 @@ async fn main(spawner: Spawner) -> ! {
     audio_stream.wait_connection().await;
 
     static VOLUME: AtomicU8 = AtomicU8::new(0);
+    static SAMPLE_RATE: Signal<ThreadModeRawMutex, u32> = Signal::new();
 
-    spawner.must_spawn(audio_processor(audio_stream, &VOLUME, i2s_peri));
+    spawner.must_spawn(audio_processor(
+        audio_stream,
+        &VOLUME,
+        &SAMPLE_RATE,
+        i2s_peri,
+    ));
+
+    let mut old_rate = 0;
     loop {
         audio_ctrl.changed().await;
         let volume = audio_ctrl.volume(Channel::LeftFront);
@@ -133,8 +124,10 @@ async fn main(spawner: Spawner) -> ! {
             None => (),
         }
         defmt::info!("Sample rate is {}", rate);
-        // defmt::info!("Blink");
-        // Timer::after(Duration::from_millis(100)).await;
+        if rate != 0 && rate != old_rate {
+            old_rate = rate;
+            SAMPLE_RATE.signal(rate);
+        }
     }
 }
 
@@ -142,32 +135,78 @@ async fn main(spawner: Spawner) -> ! {
 async fn audio_processor(
     mut stream: Stream<'static, Driver<'static, USB>>,
     volume: &'static AtomicU8,
-    i2s_peri: I2SPeripherals,
+    sample_rate: &'static Signal<ThreadModeRawMutex, u32>,
+    mut i2s_peri: I2SPeripherals,
 ) -> ! {
     stream.wait_connection().await;
-    let mut buf = [0; MAX_PACKET_SIZE];
+    let mut current_rate = sample_rate.wait().await;
+
+    // let mut in_buf = [0; MAX_PACKET_SIZE];
+
+    // create two audio buffers (back and front) which will take turns being
+    // filled with new audio data and being sent to the pio fifo using dma
+    static DMA_BUFFER: StaticCell<[u32; MAX_PACKET_SIZE / 4 * 2]> = StaticCell::new();
+    let dma_buffer = DMA_BUFFER.init_with(|| [0u32; MAX_PACKET_SIZE / 4 * 2]);
+    let (mut back_buffer, mut front_buffer) = dma_buffer.split_at_mut(MAX_PACKET_SIZE / 4);
+
     loop {
-        let n = match stream.read_packet(&mut buf).await {
-            Ok(n) => n,
-            Err(e) => {
-                defmt::info!("Stream read error: {}", e);
-                continue;
-            }
-        };
-        let now = Instant::now();
-        let vol = volume.load(core::sync::atomic::Ordering::Relaxed);
-        for i in (0..n).step_by(3) {
-            let mut sample = BigEndian::read_i24(&buf[i..i + 3]);
-            sample /= LUT_100DB[vol as usize] as i32;
-            BigEndian::write_i24(&mut buf[i..i + 3], sample);
-        }
-        core::hint::black_box(&buf);
-        defmt::info!(
-            "Applied volume (-{}dB) to {} samples in {}us",
-            vol,
-            n / 3,
-            now.elapsed().as_micros()
+        // Setup pio state machine for i2s output
+        let Pio {
+            mut common, sm0, ..
+        } = Pio::new(i2s_peri.pio0.reborrow(), PioIrqs);
+
+        let program = PioI2sOutProgram::new(&mut common);
+        let mut i2s = PioI2sOut::new(
+            &mut common,
+            sm0,
+            i2s_peri.dma_channel.reborrow(),
+            i2s_peri.data_pin.reborrow(),
+            i2s_peri.bit_clock_pin.reborrow(),
+            i2s_peri.left_right_clock_pin.reborrow(),
+            current_rate,
+            24,
+            &program,
         );
+
+        // process audio data until sample-rate changes
+        let mut n_bytes;
+        'inner: loop {
+            if let Some(rate) = sample_rate.try_take() {
+                current_rate = rate;
+                break 'inner;
+            }
+
+            let (prefix, in_buf, suffix) = unsafe { back_buffer.align_to_mut::<u8>() };
+            assert!(prefix.is_empty());
+            assert!(suffix.is_empty());
+
+            n_bytes = match stream.read_packet(in_buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    defmt::info!("Stream read error: {}", e);
+                    continue 'inner;
+                }
+            };
+
+            let dma_future = i2s.write(&front_buffer[..n_bytes / 4]);
+
+            let now = Instant::now();
+            let vol = volume.load(core::sync::atomic::Ordering::Relaxed);
+            apply_volume(&mut in_buf[..n_bytes], vol);
+            let vol_calc_time = now.elapsed();
+
+            let now = Instant::now();
+            dma_future.await;
+            let dma_wait_time = now.elapsed();
+            mem::swap(&mut back_buffer, &mut front_buffer);
+
+            defmt::info!(
+                "Waited {}us for DMA to finish, volume calc (-{}dB) took {}us",
+                dma_wait_time.as_micros(),
+                vol,
+                vol_calc_time.as_micros()
+            );
+        }
     }
 }
 
@@ -181,6 +220,19 @@ fn create_usb_conf() -> Config<'static> {
     conf.product = Some("RP2040 Soundcard");
     conf.manufacturer = Some("RT-CUSTOMZ");
     conf
+}
+
+/// Apply `vol` dB attenuation to 24bit PCM data
+#[inline]
+fn apply_volume(buf: &mut [u8], vol: u8) {
+    if LUT_100DB[vol as usize] == 1 {
+        return;
+    }
+    for i in (0..buf.len()).step_by(3) {
+        let mut sample = BigEndian::read_i24(&buf[i..i + 3]);
+        sample /= LUT_100DB[vol as usize] as i32;
+        BigEndian::write_i24(&mut buf[i..i + 3], sample);
+    }
 }
 
 // 24bit big endian read and write implementation

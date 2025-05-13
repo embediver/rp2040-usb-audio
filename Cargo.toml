@@ -39,11 +39,11 @@ proc-lut = { path = "proc-lut" }
 byteorder = { version = "1.5", default-features = false }
 
 [patch.crates-io]
-embassy-executor = { git = "https://github.com/embassy-rs/embassy.git", commit = "f9f20ae2174cb26d0f8926207d179041cfec2d2e" }
-embassy-sync = { git = "https://github.com/embassy-rs/embassy.git", commit = "f9f20ae2174cb26d0f8926207d179041cfec2d2e" }
-embassy-time = { git = "https://github.com/embassy-rs/embassy.git", commit = "f9f20ae2174cb26d0f8926207d179041cfec2d2e" }
-embassy-rp = { git = "https://github.com/embassy-rs/embassy.git", commit = "f9f20ae2174cb26d0f8926207d179041cfec2d2e" }
-embassy-usb = { git = "https://github.com/embassy-rs/embassy.git", commit = "f9f20ae2174cb26d0f8926207d179041cfec2d2e" }
+embassy-executor = { git = "https://github.com/embediver/embassy.git", branch = "pio-i2s-bit-depth-config" }
+embassy-sync = { git = "https://github.com/embediver/embassy.git", branch = "pio-i2s-bit-depth-config" }
+embassy-time = { git = "https://github.com/embediver/embassy.git", branch = "pio-i2s-bit-depth-config" }
+embassy-rp = { git = "https://github.com/embediver/embassy.git", branch = "pio-i2s-bit-depth-config" }
+embassy-usb = { git = "https://github.com/embediver/embassy.git", branch = "pio-i2s-bit-depth-config" }
 
 
 [profile.release]
