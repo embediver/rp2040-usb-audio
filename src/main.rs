@@ -169,21 +169,19 @@ async fn audio_processor(
             24,
             &program,
         );
+        defmt::info!("I2S set-up to {}Hz", current_rate);
 
         // process audio data until sample-rate changes
         let mut n_bytes = 0;
-        let mut now = Instant::now();
         'inner: loop {
+            let dma_future = i2s.write(&front_buffer[..n_bytes / 4]);
+            let i2s_start_time = Instant::now();
+
             if let Some(rate) = sample_rate.try_take() {
                 current_rate = rate;
+                defmt::info!("Sample rate changed to {}Hz, restarting I2S...", rate);
                 break 'inner;
             }
-
-            // let (prefix, in_buf, suffix) = unsafe { back_buffer.align_to_mut::<u8>() };
-            // assert!(prefix.is_empty());
-            // assert!(suffix.is_empty());
-
-            let dma_future = i2s.write(&front_buffer[..n_bytes / 4]);
 
             n_bytes = match stream.read_packet(&mut in_buf).await {
                 Ok(n) => n,
@@ -193,28 +191,42 @@ async fn audio_processor(
                 }
             };
             assert_eq!(n_bytes % 4, 0);
-            let loop_time = now.elapsed();
-            now = Instant::now();
-            if loop_time > Duration::from_micros(1050) {
-                defmt::info!("Loop took {}us", loop_time.as_micros());
+            let usb_packet_delay = i2s_start_time.elapsed();
+
+            // Remove two samples (1x left, 1x right) if the packet arrived to early
+            if usb_packet_delay.as_micros() < 50 {
+                n_bytes -= 12;
             }
 
             let vol = volume.load(core::sync::atomic::Ordering::Relaxed);
-            apply_volume(&mut in_buf[..n_bytes], vol);
+            convert_buf(&mut in_buf[..n_bytes], vol);
 
+            // Incoming PCM data is little endian
             // b0:lo_L, b1:mid_L, b2:hi_L, b3:lo_R, b4:mid_R, b5:hi_R
-            // copy from u8 slice to u32 slice
+            // I2S demands big endian data
+            // The individual samples were already stored in the right format in the volume application step,
+            // so we just copy from u8 slice to u32 slice in big endian format
             BigEndian::read_u32_into(&in_buf[..n_bytes], &mut back_buffer[..n_bytes / 4]);
+
+            let i2s_passed_time = i2s_start_time.elapsed();
+
+            if i2s_passed_time > Duration::from_millis(1) {
+                defmt::warn!("I2S already ran for {}us", i2s_passed_time.as_micros());
+            } else if i2s_passed_time > Duration::from_micros(950) {
+                defmt::warn!(
+                    "Estimated I2S remaining time is under {}us, adding samples...",
+                    (Duration::from_millis(1) - i2s_passed_time).as_micros()
+                );
+                // This happens when the I2S Clock is running marginally faster than the PC delivers the Samples.
+                // We compensate by repeating the last 4 samples (2 left, 2 right) for the current buffer.
+                let end_pos = n_bytes / 4;
+                let (front, back) = back_buffer.split_at_mut(end_pos);
+                back[..3].copy_from_slice(&front[end_pos - 3..]);
+                n_bytes += 12;
+            }
 
             dma_future.await;
             mem::swap(&mut back_buffer, &mut front_buffer);
-
-            // defmt::info!(
-            //     "Waited {}us for DMA to finish, volume calc (-{}dB) took {}us",
-            //     dma_wait_time.as_micros(),
-            //     vol,
-            //     vol_calc_time.as_micros()
-            // );
         }
     }
 }
@@ -231,22 +243,18 @@ fn create_usb_conf() -> Config<'static> {
     conf
 }
 
-/// Apply `vol` dB attenuation to 24bit PCM data and convert from little- to big-endian
+/// Convert the buffer from 24bit PCM big- to little-endian and apply a attenuation
+///
+/// The volume (attenuation) has to be in dB from 0dB (no attenuation) to 100dB (maximum attenuation).
 #[inline]
-fn apply_volume(buf: &mut [u8], vol: u8) {
-    let mut all_zero = true;
+fn convert_buf(buf: &mut [u8], vol: u8) {
+    assert!(vol <= 100);
     for i in (0..buf.len()).step_by(3) {
         let mut sample = LittleEndian::read_i24(&buf[i..i + 3]);
-        if sample != 0 {
-            all_zero = false;
-        }
         if LUT_100DB[vol as usize] != 1 {
             sample /= LUT_100DB[vol as usize] as i32;
         }
         BigEndian::write_i24(&mut buf[i..i + 3], sample);
-    }
-    if all_zero {
-        defmt::warn!("Got buffer with all zero data!");
     }
 }
 
