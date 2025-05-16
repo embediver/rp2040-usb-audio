@@ -336,7 +336,7 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 [[package]]
 name = "embassy-embedded-hal"
 version = "0.3.0"
-source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#fd9ed3924c5a7c4ef4f9bc4b8a4f934ad2bcc486"
+source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#58383465d52b45016f88aa6af081f60d67d2b123"
 dependencies = [
  "embassy-futures",
  "embassy-hal-internal",
@@ -353,7 +353,7 @@ dependencies = [
 [[package]]
 name = "embassy-executor"
 version = "0.7.0"
-source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#fd9ed3924c5a7c4ef4f9bc4b8a4f934ad2bcc486"
+source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#58383465d52b45016f88aa6af081f60d67d2b123"
 dependencies = [
  "cortex-m",
  "critical-section",
@@ -365,7 +365,7 @@ dependencies = [
 [[package]]
 name = "embassy-executor-macros"
 version = "0.6.2"
-source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#fd9ed3924c5a7c4ef4f9bc4b8a4f934ad2bcc486"
+source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#58383465d52b45016f88aa6af081f60d67d2b123"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -376,12 +376,12 @@ dependencies = [
 [[package]]
 name = "embassy-futures"
 version = "0.1.1"
-source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#fd9ed3924c5a7c4ef4f9bc4b8a4f934ad2bcc486"
+source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#58383465d52b45016f88aa6af081f60d67d2b123"
 
 [[package]]
 name = "embassy-hal-internal"
 version = "0.2.0"
-source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#fd9ed3924c5a7c4ef4f9bc4b8a4f934ad2bcc486"
+source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#58383465d52b45016f88aa6af081f60d67d2b123"
 dependencies = [
  "cortex-m",
  "critical-section",
@@ -392,12 +392,12 @@ dependencies = [
 [[package]]
 name = "embassy-net-driver"
 version = "0.2.0"
-source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#fd9ed3924c5a7c4ef4f9bc4b8a4f934ad2bcc486"
+source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#58383465d52b45016f88aa6af081f60d67d2b123"
 
 [[package]]
 name = "embassy-net-driver-channel"
 version = "0.3.0"
-source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#fd9ed3924c5a7c4ef4f9bc4b8a4f934ad2bcc486"
+source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#58383465d52b45016f88aa6af081f60d67d2b123"
 dependencies = [
  "embassy-futures",
  "embassy-net-driver",
@@ -407,7 +407,7 @@ dependencies = [
 [[package]]
 name = "embassy-rp"
 version = "0.4.0"
-source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#fd9ed3924c5a7c4ef4f9bc4b8a4f934ad2bcc486"
+source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#58383465d52b45016f88aa6af081f60d67d2b123"
 dependencies = [
  "atomic-polyfill",
  "cfg-if",
@@ -445,7 +445,7 @@ dependencies = [
 [[package]]
 name = "embassy-sync"
 version = "0.6.2"
-source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#fd9ed3924c5a7c4ef4f9bc4b8a4f934ad2bcc486"
+source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#58383465d52b45016f88aa6af081f60d67d2b123"
 dependencies = [
  "cfg-if",
  "critical-section",
@@ -458,7 +458,7 @@ dependencies = [
 [[package]]
 name = "embassy-time"
 version = "0.4.0"
-source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#fd9ed3924c5a7c4ef4f9bc4b8a4f934ad2bcc486"
+source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#58383465d52b45016f88aa6af081f60d67d2b123"
 dependencies = [
  "cfg-if",
  "critical-section",
@@ -474,7 +474,7 @@ dependencies = [
 [[package]]
 name = "embassy-time-driver"
 version = "0.2.0"
-source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#fd9ed3924c5a7c4ef4f9bc4b8a4f934ad2bcc486"
+source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#58383465d52b45016f88aa6af081f60d67d2b123"
 dependencies = [
  "document-features",
 ]
@@ -482,7 +482,7 @@ dependencies = [
 [[package]]
 name = "embassy-time-queue-utils"
 version = "0.1.0"
-source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#fd9ed3924c5a7c4ef4f9bc4b8a4f934ad2bcc486"
+source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#58383465d52b45016f88aa6af081f60d67d2b123"
 dependencies = [
  "embassy-executor",
  "heapless",
@@ -491,7 +491,7 @@ dependencies = [
 [[package]]
 name = "embassy-usb"
 version = "0.4.0"
-source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#fd9ed3924c5a7c4ef4f9bc4b8a4f934ad2bcc486"
+source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#58383465d52b45016f88aa6af081f60d67d2b123"
 dependencies = [
  "embassy-futures",
  "embassy-net-driver-channel",
@@ -506,7 +506,7 @@ dependencies = [
 [[package]]
 name = "embassy-usb-driver"
 version = "0.1.0"
-source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#fd9ed3924c5a7c4ef4f9bc4b8a4f934ad2bcc486"
+source = "git+https://github.com/embediver/embassy.git?branch=pio-i2s-bit-depth-config#58383465d52b45016f88aa6af081f60d67d2b123"
 dependencies = [
  "defmt 0.3.100",
  "embedded-io-async",
