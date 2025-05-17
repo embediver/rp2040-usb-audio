@@ -174,14 +174,14 @@ async fn audio_processor(
         // process audio data until sample-rate changes
         let mut n_bytes = 0;
         'inner: loop {
-            let dma_future = i2s.write(&front_buffer[..n_bytes / 4]);
-            let i2s_start_time = Instant::now();
-
             if let Some(rate) = sample_rate.try_take() {
                 current_rate = rate;
                 defmt::info!("Sample rate changed to {}Hz, restarting I2S...", rate);
                 break 'inner;
             }
+
+            let dma_future = i2s.write(&front_buffer[..n_bytes / 4]);
+            let i2s_start_time = Instant::now();
 
             n_bytes = match stream.read_packet(&mut in_buf).await {
                 Ok(n) => n,
