@@ -96,7 +96,7 @@ async fn main(spawner: Spawner) -> ! {
         SampleWidth::Width3Byte,
         &[48000],
         &[Channel::LeftFront, Channel::RightFront],
-        FeedbackRefresh::Period64Frames,
+        FeedbackRefresh::Period16Frames,
     );
 
     let usb = usb_builder.build();
@@ -183,7 +183,7 @@ async fn audio_processor(
         let mut leftover_bytes = 0;
 
         // process audio data until sample-rate changes
-        let mut n_bytes = 0;
+        let mut next_buf_size = 0;
         'inner: loop {
             if let Some(rate) = sample_rate.try_take() {
                 current_rate = rate;
@@ -191,24 +191,25 @@ async fn audio_processor(
                 break 'inner;
             }
 
-            let dma_future = i2s.write(&front_buffer[..n_bytes / 4]);
+            let dma_future = i2s.write(&front_buffer[..next_buf_size]);
             let i2s_start_time = Instant::now();
 
-            n_bytes = match stream.read_packet(&mut in_buf[leftover_bytes..]).await {
+            let mut n_bytes = match stream.read_packet(&mut in_buf[leftover_bytes..]).await {
                 Ok(n) => n,
                 Err(e) => {
                     defmt::info!("Stream read error: {}", e);
                     continue 'inner;
                 }
             };
+            assert_eq!(n_bytes % 6, 0);
             let usb_packet_delay = i2s_start_time.elapsed();
             synch_feedback.signal(usb_packet_delay);
-            defmt::info!(
-                "Got {} samples ({} bytes) and {} leftover samples",
-                n_bytes / 3,
-                n_bytes,
-                leftover_bytes / 3
-            );
+            // info!(
+            //     "Got {} samples ({} bytes) and {} leftover samples",
+            //     n_bytes / 3,
+            //     n_bytes,
+            //     leftover_bytes / 3
+            // );
 
             // 1. Calculate the number of bytes in our in_buf we need to send out.
             //    This is the received bytes + leftover bytes.
@@ -220,6 +221,12 @@ async fn audio_processor(
             assert_eq!(work_slice_size % 4, 0);
             let work_slice = &mut in_buf[..work_slice_size];
 
+            // info!(
+            //     "Working with {} bytes ({} samples)",
+            //     work_slice_size,
+            //     work_slice_size / 3
+            // );
+
             let vol = volume.load(core::sync::atomic::Ordering::Relaxed);
             convert_buf(work_slice, vol);
 
@@ -228,6 +235,7 @@ async fn audio_processor(
             // I2S demands big endian data
             // The individual samples were already stored in the right format in the volume application step,
             // so we just copy from u8 slice to u32 slice in big endian format
+            next_buf_size = work_slice_size / 4;
             BigEndian::read_u32_into(work_slice, &mut back_buffer[..work_slice_size / 4]);
 
             // Bytes have now been written to the outgoing buffer,
@@ -246,12 +254,6 @@ async fn audio_processor(
                     "Estimated I2S remaining time is under {}us",
                     (Duration::from_millis(1) - i2s_passed_time).as_micros()
                 );
-                // This happens when the I2S Clock is running marginally faster than the PC delivers the Samples.
-                // We compensate by repeating the last 4 samples (2 left, 2 right) for the current buffer.
-                // let end_pos = n_bytes / 4;
-                // let (front, back) = back_buffer.split_at_mut(end_pos);
-                // back[..3].copy_from_slice(&front[end_pos - 3..]);
-                // n_bytes += 12;
             }
 
             dma_future.await;
@@ -270,45 +272,79 @@ async fn feedback_task(
     mut feedback: Feedback<'static, Driver<'static, USB>>,
     synch_feedback: &'static Signal<ThreadModeRawMutex, Duration>,
 ) -> ! {
-    use fixed::types::U10F22;
-    const FEEDBACK_RATE: usize = 64;
+    const FEEDBACK_RATE: usize = 16;
 
-    let mut desired_spp: f64 = 48.;
+    let mut desired_spp = 48.;
     loop {
-        let prev_delay = synch_feedback.wait().await.as_micros() as i64;
-        for _ in 0..FEEDBACK_RATE - 2 {
-            info!("delay: {}", synch_feedback.wait().await);
+        // let prev_delay = synch_feedback.wait().await.as_micros() as i64;
+        // for _ in 0..FEEDBACK_RATE - 2 {
+        //     // info!("delay: {}us", synch_feedback.wait().await.as_micros());
+        //     synch_feedback.wait().await;
+        // }
+        // let delay = synch_feedback.wait().await.as_micros() as i64;
+        // let delta = prev_delay - delay;
+        // info!(
+        //     "Delay changed from {}us to {}us ({}us delta) over the last {} packets",
+        //     prev_delay, delay, delta, FEEDBACK_RATE
+        // );
+
+        let mut values = [0; FEEDBACK_RATE];
+        for val in &mut values {
+            *val = synch_feedback.wait().await.as_micros() as u16;
         }
-        let delay = synch_feedback.wait().await.as_micros() as i64;
-        let delta = prev_delay - delay;
-        info!(
-            "Delay changed from {}us to {}us ({}us delta) over the last 64 packets",
-            prev_delay, delay, delta
-        );
+        let avg = values.iter().sum::<u16>() / FEEDBACK_RATE as u16;
+        info!("Avg delay for last {} packets is {}us", FEEDBACK_RATE, avg);
 
-        if delta > 500 {
-            defmt::warn!("Found delta greater than 20us, skipping feedback!");
-            continue;
+        // if delta > 200 {
+        //     defmt::warn!("Found delta greater than 200us, skipping feedback!");
+        //     continue;
+        // }
+
+        if avg > 350 {
+            // Packets arrive to late
+            // Set to a faster rate...
+            defmt::warn!("Packets arrive to late!");
+            desired_spp = 48.02;
         }
 
-        // delta us per packet
-        let d_us_pp = delta as f64 / FEEDBACK_RATE as f64;
-        // desired samples per packet
-        desired_spp = (-1. * d_us_pp * samples_p_us(48000.)) + 48.;
-        info!("Desired samples per packet should thus be {}", desired_spp);
-        let desired_spp_10_22: U10F22 = U10F22::from_num(desired_spp);
+        if avg < 30 {
+            // Packets arrive to early to determine a correct delta
+            // Set to a slower rate...
+            defmt::warn!("Packets arive to early!");
+            desired_spp = 47.98;
+        }
 
-        let data = desired_spp_10_22.to_le_bytes();
-
-        info!("In 10.14 format: {:x}", data[1..]);
-
-        match feedback.write_packet(&data[1..]).await {
+        let data = format_10_14(desired_spp);
+        match feedback.write_packet(&data).await {
             Ok(_) => {}
             Err(e) => {
                 defmt::error!("Error writing feedback packet: {}", e);
             }
         }
+
+        // // delta us per packet
+        // let d_us_pp = delta as f64 / FEEDBACK_RATE as f64;
+        // // desired samples per packet
+        // let desired_spp = (-1. * d_us_pp * samples_p_us(48000.)) + 48.;
+        // info!("Desired samples per packet should thus be {}", desired_spp);
+
+        // let data = format_10_14(desired_spp);
+        // match feedback.write_packet(&data).await {
+        //     Ok(_) => {}
+        //     Err(e) => {
+        //         defmt::error!("Error writing feedback packet: {}", e);
+        //     }
+        // }
     }
+}
+
+fn format_10_14(num: f64) -> [u8; 3] {
+    use fixed::types::U10F22;
+    let desired_spp_10_22: U10F22 = U10F22::from_num(num);
+
+    let mut out = [0; 3];
+    out.copy_from_slice(&desired_spp_10_22.to_le_bytes()[1..]);
+    out
 }
 
 const fn samples_p_us(sample_rate_hz: f64) -> f64 {
