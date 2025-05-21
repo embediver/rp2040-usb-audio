@@ -3,6 +3,7 @@
 
 use core::{mem, sync::atomic::AtomicU8};
 
+use defmt::info;
 use embassy_executor::Spawner;
 use embassy_rp::{
     Peri, bind_interrupts,
@@ -18,7 +19,10 @@ use {defmt_rtt as _, panic_probe as _};
 
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::signal::Signal;
-use embassy_usb::{Builder, Config, class::uac1::speaker::Stream};
+use embassy_usb::{
+    Builder, Config,
+    class::uac1::speaker::{Feedback, Stream},
+};
 use embassy_usb::{
     UsbDevice,
     class::uac1::{
@@ -90,9 +94,9 @@ async fn main(spawner: Spawner) -> ! {
         UAC_STATE.init(State::new()),
         576,
         SampleWidth::Width3Byte,
-        &[44100, 48000, 96000],
+        &[48000],
         &[Channel::LeftFront, Channel::RightFront],
-        FeedbackRefresh::Period16Frames,
+        FeedbackRefresh::Period64Frames,
     );
 
     let usb = usb_builder.build();
@@ -104,11 +108,15 @@ async fn main(spawner: Spawner) -> ! {
 
     static VOLUME: AtomicU8 = AtomicU8::new(0);
     static SAMPLE_RATE: Signal<ThreadModeRawMutex, u32> = Signal::new();
+    static SYNCH_FEEDBACK: Signal<ThreadModeRawMutex, Duration> = Signal::new();
+
+    spawner.must_spawn(feedback_task(feedback, &SYNCH_FEEDBACK));
 
     spawner.must_spawn(audio_processor(
         audio_stream,
         &VOLUME,
         &SAMPLE_RATE,
+        &SYNCH_FEEDBACK,
         i2s_peri,
     ));
 
@@ -138,6 +146,7 @@ async fn audio_processor(
     mut stream: Stream<'static, Driver<'static, USB>>,
     volume: &'static AtomicU8,
     sample_rate: &'static Signal<ThreadModeRawMutex, u32>,
+    synch_feedback: &'static Signal<ThreadModeRawMutex, Duration>,
     mut i2s_peri: I2SPeripherals,
 ) -> ! {
     stream.wait_connection().await;
@@ -171,6 +180,8 @@ async fn audio_processor(
         );
         defmt::info!("I2S set-up to {}Hz", current_rate);
 
+        let mut leftover_bytes = 0;
+
         // process audio data until sample-rate changes
         let mut n_bytes = 0;
         'inner: loop {
@@ -183,46 +194,64 @@ async fn audio_processor(
             let dma_future = i2s.write(&front_buffer[..n_bytes / 4]);
             let i2s_start_time = Instant::now();
 
-            n_bytes = match stream.read_packet(&mut in_buf).await {
+            n_bytes = match stream.read_packet(&mut in_buf[leftover_bytes..]).await {
                 Ok(n) => n,
                 Err(e) => {
                     defmt::info!("Stream read error: {}", e);
                     continue 'inner;
                 }
             };
-            assert_eq!(n_bytes % 4, 0);
             let usb_packet_delay = i2s_start_time.elapsed();
+            synch_feedback.signal(usb_packet_delay);
+            defmt::info!(
+                "Got {} samples ({} bytes) and {} leftover samples",
+                n_bytes / 3,
+                n_bytes,
+                leftover_bytes / 3
+            );
 
-            // Remove two samples (1x left, 1x right) if the packet arrived to early
-            if usb_packet_delay.as_micros() < 50 {
-                n_bytes -= 12;
-            }
+            // 1. Calculate the number of bytes in our in_buf we need to send out.
+            //    This is the received bytes + leftover bytes.
+            // 2. Calculate how many bytes will be left over again.
+            // 3. Create a slice which holds all the bytes we wan't to process and send out in this pass
+            n_bytes += leftover_bytes;
+            leftover_bytes = n_bytes % 12; // 12 = least common multiple of 3 and 4
+            let work_slice_size = n_bytes - leftover_bytes;
+            assert_eq!(work_slice_size % 4, 0);
+            let work_slice = &mut in_buf[..work_slice_size];
 
             let vol = volume.load(core::sync::atomic::Ordering::Relaxed);
-            convert_buf(&mut in_buf[..n_bytes], vol);
+            convert_buf(work_slice, vol);
 
             // Incoming PCM data is little endian
             // b0:lo_L, b1:mid_L, b2:hi_L, b3:lo_R, b4:mid_R, b5:hi_R
             // I2S demands big endian data
             // The individual samples were already stored in the right format in the volume application step,
             // so we just copy from u8 slice to u32 slice in big endian format
-            BigEndian::read_u32_into(&in_buf[..n_bytes], &mut back_buffer[..n_bytes / 4]);
+            BigEndian::read_u32_into(work_slice, &mut back_buffer[..work_slice_size / 4]);
+
+            // Bytes have now been written to the outgoing buffer,
+            // Copy any leftover bytes to the start of the incoming buffer.
+            if leftover_bytes != 0 {
+                let (start, leftover) = in_buf.split_at_mut(work_slice_size);
+                start[..leftover_bytes].copy_from_slice(&leftover[..leftover_bytes]);
+            }
 
             let i2s_passed_time = i2s_start_time.elapsed();
 
             if i2s_passed_time > Duration::from_millis(1) {
                 defmt::warn!("I2S already ran for {}us", i2s_passed_time.as_micros());
-            } else if i2s_passed_time > Duration::from_micros(950) {
+            } else if i2s_passed_time > Duration::from_micros(800) {
                 defmt::warn!(
-                    "Estimated I2S remaining time is under {}us, adding samples...",
+                    "Estimated I2S remaining time is under {}us",
                     (Duration::from_millis(1) - i2s_passed_time).as_micros()
                 );
                 // This happens when the I2S Clock is running marginally faster than the PC delivers the Samples.
                 // We compensate by repeating the last 4 samples (2 left, 2 right) for the current buffer.
-                let end_pos = n_bytes / 4;
-                let (front, back) = back_buffer.split_at_mut(end_pos);
-                back[..3].copy_from_slice(&front[end_pos - 3..]);
-                n_bytes += 12;
+                // let end_pos = n_bytes / 4;
+                // let (front, back) = back_buffer.split_at_mut(end_pos);
+                // back[..3].copy_from_slice(&front[end_pos - 3..]);
+                // n_bytes += 12;
             }
 
             dma_future.await;
@@ -234,6 +263,56 @@ async fn audio_processor(
 #[embassy_executor::task]
 async fn usb_task(mut usb: UsbDevice<'static, Driver<'static, USB>>) -> ! {
     usb.run().await
+}
+
+#[embassy_executor::task]
+async fn feedback_task(
+    mut feedback: Feedback<'static, Driver<'static, USB>>,
+    synch_feedback: &'static Signal<ThreadModeRawMutex, Duration>,
+) -> ! {
+    use fixed::types::U10F22;
+    const FEEDBACK_RATE: usize = 64;
+
+    let mut desired_spp: f64 = 48.;
+    loop {
+        let prev_delay = synch_feedback.wait().await.as_micros() as i64;
+        for _ in 0..FEEDBACK_RATE - 2 {
+            info!("delay: {}", synch_feedback.wait().await);
+        }
+        let delay = synch_feedback.wait().await.as_micros() as i64;
+        let delta = prev_delay - delay;
+        info!(
+            "Delay changed from {}us to {}us ({}us delta) over the last 64 packets",
+            prev_delay, delay, delta
+        );
+
+        if delta > 500 {
+            defmt::warn!("Found delta greater than 20us, skipping feedback!");
+            continue;
+        }
+
+        // delta us per packet
+        let d_us_pp = delta as f64 / FEEDBACK_RATE as f64;
+        // desired samples per packet
+        desired_spp = (-1. * d_us_pp * samples_p_us(48000.)) + 48.;
+        info!("Desired samples per packet should thus be {}", desired_spp);
+        let desired_spp_10_22: U10F22 = U10F22::from_num(desired_spp);
+
+        let data = desired_spp_10_22.to_le_bytes();
+
+        info!("In 10.14 format: {:x}", data[1..]);
+
+        match feedback.write_packet(&data[1..]).await {
+            Ok(_) => {}
+            Err(e) => {
+                defmt::error!("Error writing feedback packet: {}", e);
+            }
+        }
+    }
+}
+
+const fn samples_p_us(sample_rate_hz: f64) -> f64 {
+    sample_rate_hz / 1_000_000.
 }
 
 fn create_usb_conf() -> Config<'static> {
