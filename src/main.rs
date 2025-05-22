@@ -96,7 +96,7 @@ async fn main(spawner: Spawner) -> ! {
         SampleWidth::Width3Byte,
         &[48000],
         &[Channel::LeftFront, Channel::RightFront],
-        FeedbackRefresh::Period16Frames,
+        FeedbackRefresh::Period32Frames,
     );
 
     let usb = usb_builder.build();
@@ -272,39 +272,32 @@ async fn feedback_task(
     mut feedback: Feedback<'static, Driver<'static, USB>>,
     synch_feedback: &'static Signal<ThreadModeRawMutex, Duration>,
 ) -> ! {
-    const FEEDBACK_RATE: usize = 16;
+    const FEEDBACK_RATE: usize = 32;
 
     let mut desired_spp = 48.;
+    let mut prev_avg = 0;
     loop {
-        // let prev_delay = synch_feedback.wait().await.as_micros() as i64;
-        // for _ in 0..FEEDBACK_RATE - 2 {
-        //     // info!("delay: {}us", synch_feedback.wait().await.as_micros());
-        //     synch_feedback.wait().await;
-        // }
-        // let delay = synch_feedback.wait().await.as_micros() as i64;
-        // let delta = prev_delay - delay;
-        // info!(
-        //     "Delay changed from {}us to {}us ({}us delta) over the last {} packets",
-        //     prev_delay, delay, delta, FEEDBACK_RATE
-        // );
-
         let mut values = [0; FEEDBACK_RATE];
         for val in &mut values {
             *val = synch_feedback.wait().await.as_micros() as u16;
         }
         let avg = values.iter().sum::<u16>() / FEEDBACK_RATE as u16;
-        info!("Avg delay for last {} packets is {}us", FEEDBACK_RATE, avg);
 
-        // if delta > 200 {
-        //     defmt::warn!("Found delta greater than 200us, skipping feedback!");
-        //     continue;
-        // }
+        let delta = prev_avg as i16 - avg as i16;
+        prev_avg = avg;
 
-        if avg > 350 {
+        info!(
+            "Avg delay for last {} packets is {}us, {}us delta to previous",
+            FEEDBACK_RATE, avg, delta
+        );
+
+        if avg > 150 {
             // Packets arrive to late
             // Set to a faster rate...
             defmt::warn!("Packets arrive to late!");
             desired_spp = 48.02;
+            write_feedback(&mut feedback, desired_spp).await;
+            continue;
         }
 
         if avg < 30 {
@@ -312,32 +305,26 @@ async fn feedback_task(
             // Set to a slower rate...
             defmt::warn!("Packets arive to early!");
             desired_spp = 47.98;
+            write_feedback(&mut feedback, desired_spp).await;
+            continue;
         }
 
-        let data = format_10_14(desired_spp);
-        match feedback.write_packet(&data).await {
-            Ok(_) => {}
-            Err(e) => {
-                defmt::error!("Error writing feedback packet: {}", e);
-            }
+        if delta > 200 {
+            defmt::warn!("Found delta greater than 100us, skipping feedback!");
+            continue;
         }
 
-        // // delta us per packet
-        // let d_us_pp = delta as f64 / FEEDBACK_RATE as f64;
-        // // desired samples per packet
-        // let desired_spp = (-1. * d_us_pp * samples_p_us(48000.)) + 48.;
-        // info!("Desired samples per packet should thus be {}", desired_spp);
+        // delta us per packet
+        let d_us_pp = delta as f64 / FEEDBACK_RATE as f64;
+        // desired samples per packet
+        desired_spp += -0.3 * d_us_pp * samples_p_us(48000.);
+        info!("Desired samples per packet should thus be {}", desired_spp);
 
-        // let data = format_10_14(desired_spp);
-        // match feedback.write_packet(&data).await {
-        //     Ok(_) => {}
-        //     Err(e) => {
-        //         defmt::error!("Error writing feedback packet: {}", e);
-        //     }
-        // }
+        write_feedback(&mut feedback, desired_spp).await;
     }
 }
 
+/// Formats a value as 10.14 fixed point value as per USB 2.0 spec Section 5.12.4.2
 fn format_10_14(num: f64) -> [u8; 3] {
     use fixed::types::U10F22;
     let desired_spp_10_22: U10F22 = U10F22::from_num(num);
@@ -345,6 +332,19 @@ fn format_10_14(num: f64) -> [u8; 3] {
     let mut out = [0; 3];
     out.copy_from_slice(&desired_spp_10_22.to_le_bytes()[1..]);
     out
+}
+
+/// Write a feedback value to the feedback endpoint
+///
+/// `desired_spp` is the desired samples per packet.
+async fn write_feedback(feedback: &mut Feedback<'static, Driver<'static, USB>>, desired_spp: f64) {
+    let data = format_10_14(desired_spp);
+    match feedback.write_packet(&data).await {
+        Ok(_) => {}
+        Err(e) => {
+            defmt::error!("Error writing feedback packet: {}", e);
+        }
+    }
 }
 
 const fn samples_p_us(sample_rate_hz: f64) -> f64 {
