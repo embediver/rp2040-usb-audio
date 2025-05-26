@@ -13,12 +13,11 @@ use embassy_rp::{
     usb::{self, Driver},
 };
 use embassy_time::{Duration, Instant};
-// use embassy_time::{Duration, Timer};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
-use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::signal::Signal;
+use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, watch};
 use embassy_usb::{
     Builder, Config,
     class::uac1::speaker::{Feedback, Stream},
@@ -37,10 +36,26 @@ use proc_lut::lut_100;
 /// Look-up-table for factors from 0-100dB
 const LUT_100DB: [u32; 101] = lut_100!();
 
-/// Maximum USB PCM Packet size
+/// Maximum USB PCM Packet/Frame size (in bytes)
 ///
-/// 24bit * 2samples * 96kHz * 1ms
-const MAX_PACKET_SIZE: usize = (3 * 2) * (96000 / 1000);
+/// 24bit * 2samples * 96kHz * 1ms + 24bit * 6samples
+///
+/// 6sample (3left, 3right) extra to account for sync mismatch compensation.
+const MAX_PACKET_SIZE: usize = (3 * 2) * (96000 / 1000) + (3 * 6);
+
+/// u32 DMA buffer size
+///
+/// Two times the size to hold a single frame.
+const DMA_BUFFER_SIZE: usize = MAX_PACKET_SIZE / 4 * 2;
+
+/// Synch feedback every x packets
+const FEEDBACK_RATE: FeedbackRefresh = FeedbackRefresh::Period32Frames;
+
+/// Supported sample rates
+// TODO: Research why 96kHz is problematic.
+//       Compute power doesn't seem to be the issue.
+//       Probably the PIO clock isn't running at a suitable frequency.
+const SUPPORTED_SAMPLE_RATES: [u32; 2] = [44100, 48000];
 
 bind_interrupts!(struct UsbIrqs {
     USBCTRL_IRQ => usb::InterruptHandler<embassy_rp::peripherals::USB>;
@@ -94,9 +109,9 @@ async fn main(spawner: Spawner) -> ! {
         UAC_STATE.init(State::new()),
         576,
         SampleWidth::Width3Byte,
-        &[48000],
+        &SUPPORTED_SAMPLE_RATES,
         &[Channel::LeftFront, Channel::RightFront],
-        FeedbackRefresh::Period32Frames,
+        FEEDBACK_RATE,
     );
 
     let usb = usb_builder.build();
@@ -107,15 +122,19 @@ async fn main(spawner: Spawner) -> ! {
     audio_stream.wait_connection().await;
 
     static VOLUME: AtomicU8 = AtomicU8::new(0);
-    static SAMPLE_RATE: Signal<ThreadModeRawMutex, u32> = Signal::new();
+    static SAMPLE_RATE: watch::Watch<ThreadModeRawMutex, u32, 2> = watch::Watch::new();
     static SYNCH_FEEDBACK: Signal<ThreadModeRawMutex, Duration> = Signal::new();
 
-    spawner.must_spawn(feedback_task(feedback, &SYNCH_FEEDBACK));
+    spawner.must_spawn(feedback_task(
+        feedback,
+        &SYNCH_FEEDBACK,
+        SAMPLE_RATE.dyn_receiver().unwrap(),
+    ));
 
     spawner.must_spawn(audio_processor(
         audio_stream,
         &VOLUME,
-        &SAMPLE_RATE,
+        SAMPLE_RATE.dyn_receiver().unwrap(),
         &SYNCH_FEEDBACK,
         i2s_peri,
     ));
@@ -136,7 +155,7 @@ async fn main(spawner: Spawner) -> ! {
         defmt::info!("Sample rate is {}", rate);
         if rate != 0 && rate != old_rate {
             old_rate = rate;
-            SAMPLE_RATE.signal(rate);
+            SAMPLE_RATE.sender().send(rate);
         }
     }
 }
@@ -145,20 +164,20 @@ async fn main(spawner: Spawner) -> ! {
 async fn audio_processor(
     mut stream: Stream<'static, Driver<'static, USB>>,
     volume: &'static AtomicU8,
-    sample_rate: &'static Signal<ThreadModeRawMutex, u32>,
+    mut sample_rate: watch::DynReceiver<'static, u32>,
     synch_feedback: &'static Signal<ThreadModeRawMutex, Duration>,
     mut i2s_peri: I2SPeripherals,
 ) -> ! {
     stream.wait_connection().await;
-    let mut current_rate = sample_rate.wait().await;
+    let mut current_rate = sample_rate.get().await;
 
     let mut in_buf = [0; MAX_PACKET_SIZE];
 
     // create two audio buffers (back and front) which will take turns being
     // filled with new audio data and being sent to the pio fifo using dma
-    static DMA_BUFFER: StaticCell<[u32; MAX_PACKET_SIZE / 4 * 2]> = StaticCell::new();
-    let dma_buffer = DMA_BUFFER.init_with(|| [0u32; MAX_PACKET_SIZE / 4 * 2]);
-    let (mut back_buffer, mut front_buffer) = dma_buffer.split_at_mut(MAX_PACKET_SIZE / 4);
+    static DMA_BUFFER: StaticCell<[u32; DMA_BUFFER_SIZE]> = StaticCell::new();
+    let dma_buffer = DMA_BUFFER.init_with(|| [0u32; DMA_BUFFER_SIZE]);
+    let (mut back_buffer, mut front_buffer) = dma_buffer.split_at_mut(DMA_BUFFER_SIZE / 2);
 
     loop {
         // Setup pio state machine for i2s output
@@ -185,7 +204,7 @@ async fn audio_processor(
         // process audio data until sample-rate changes
         let mut next_buf_size = 0;
         'inner: loop {
-            if let Some(rate) = sample_rate.try_take() {
+            if let Some(rate) = sample_rate.try_changed() {
                 current_rate = rate;
                 defmt::info!("Sample rate changed to {}Hz, restarting I2S...", rate);
                 break 'inner;
@@ -198,6 +217,7 @@ async fn audio_processor(
                 Ok(n) => n,
                 Err(e) => {
                     defmt::info!("Stream read error: {}", e);
+                    dma_future.await;
                     continue 'inner;
                 }
             };
@@ -271,40 +291,51 @@ async fn usb_task(mut usb: UsbDevice<'static, Driver<'static, USB>>) -> ! {
 async fn feedback_task(
     mut feedback: Feedback<'static, Driver<'static, USB>>,
     synch_feedback: &'static Signal<ThreadModeRawMutex, Duration>,
+    mut sample_rate: watch::DynReceiver<'static, u32>,
 ) -> ! {
-    const FEEDBACK_RATE: usize = 32;
-
     let mut desired_spp = 48.;
     let mut prev_avg = 0;
     loop {
-        let mut values = [0; FEEDBACK_RATE];
+        let sample_rate = sample_rate.get().await;
+        let nominal_spp = sample_rate as f64 / 1000.0;
+
+        let mut values = [0; FEEDBACK_RATE.frame_count()];
         for val in &mut values {
-            *val = synch_feedback.wait().await.as_micros() as u16;
+            *val = synch_feedback.wait().await.as_micros() as u32;
         }
-        let avg = values.iter().sum::<u16>() / FEEDBACK_RATE as u16;
+        let sum: u32 = values.iter().sum();
+        let avg = sum / FEEDBACK_RATE.frame_count() as u32;
 
         let delta = prev_avg as i16 - avg as i16;
         prev_avg = avg;
 
         info!(
             "Avg delay for last {} packets is {}us, {}us delta to previous",
-            FEEDBACK_RATE, avg, delta
+            FEEDBACK_RATE.frame_count(),
+            avg,
+            delta
         );
 
-        if avg > 150 {
+        if avg > 100 {
             // Packets arrive to late
             // Set to a faster rate...
-            defmt::warn!("Packets arrive to late!");
-            desired_spp = 48.02;
+            desired_spp = nominal_spp + 0.03;
+            defmt::warn!(
+                "Packets arrive to late, setting spp hard to {}spp",
+                desired_spp
+            );
             write_feedback(&mut feedback, desired_spp).await;
             continue;
         }
 
-        if avg < 30 {
+        if avg < 20 {
             // Packets arrive to early to determine a correct delta
             // Set to a slower rate...
-            defmt::warn!("Packets arive to early!");
-            desired_spp = 47.98;
+            desired_spp = nominal_spp - 0.03;
+            defmt::warn!(
+                "Packets arive to early, setting spp hard to {}spp",
+                desired_spp
+            );
             write_feedback(&mut feedback, desired_spp).await;
             continue;
         }
@@ -314,10 +345,12 @@ async fn feedback_task(
             continue;
         }
 
-        // delta us per packet
-        let d_us_pp = delta as f64 / FEEDBACK_RATE as f64;
+        // Average delay delta in us per packet.
+        // Estimate of the difference between the usb and i2s packet/transfer rate.
+        // 1us means the usb hosts sample rate is 1us/packet slower than the i2s sample rate.
+        let d_us_pp = delta as f64 / FEEDBACK_RATE.frame_count() as f64;
         // desired samples per packet
-        desired_spp += -0.3 * d_us_pp * samples_p_us(48000.);
+        desired_spp += -0.3 * d_us_pp * samples_p_us(sample_rate as f64);
         info!("Desired samples per packet should thus be {}", desired_spp);
 
         write_feedback(&mut feedback, desired_spp).await;
