@@ -38,7 +38,7 @@ const LUT_100DB: [u32; 101] = lut_100!();
 
 /// Maximum USB PCM Packet/Frame size (in bytes)
 ///
-/// 24bit * 2samples * 96kHz * 1ms + 24bit * 6samples
+/// 24bit (3 Byte) * 2samples (left/right) * 96kHz * 1ms (packet/frame interval) + 24bit * 6samples
 ///
 /// 6sample (3left, 3right) extra to account for sync mismatch compensation.
 const MAX_PACKET_SIZE: usize = (3 * 2) * (96000 / 1000) + (3 * 6);
@@ -52,10 +52,8 @@ const DMA_BUFFER_SIZE: usize = MAX_PACKET_SIZE / 4 * 2;
 const FEEDBACK_RATE: FeedbackRefresh = FeedbackRefresh::Period32Frames;
 
 /// Supported sample rates
-// TODO: Research why 96kHz is problematic.
-//       Compute power doesn't seem to be the issue.
-//       Probably the PIO clock isn't running at a suitable frequency.
-const SUPPORTED_SAMPLE_RATES: [u32; 2] = [44100, 48000];
+// TODO: While 96kHz works, the performance budget is a litle tight.
+const SUPPORTED_SAMPLE_RATES: [u32; 3] = [44100, 48000, 96000];
 
 bind_interrupts!(struct UsbIrqs {
     USBCTRL_IRQ => usb::InterruptHandler<embassy_rp::peripherals::USB>;
@@ -107,7 +105,7 @@ async fn main(spawner: Spawner) -> ! {
     let (mut audio_stream, mut feedback, audio_ctrl) = Speaker::new(
         &mut usb_builder,
         UAC_STATE.init(State::new()),
-        576,
+        MAX_PACKET_SIZE as u16,
         SampleWidth::Width3Byte,
         &SUPPORTED_SAMPLE_RATES,
         &[Channel::LeftFront, Channel::RightFront],
@@ -221,7 +219,7 @@ async fn audio_processor(
                     continue 'inner;
                 }
             };
-            assert_eq!(n_bytes % 6, 0);
+            assert_eq!(n_bytes % 6, 0); // sanity check if we got an equal amount of left and right samples with 24bit each
             let usb_packet_delay = i2s_start_time.elapsed();
             synch_feedback.signal(usb_packet_delay);
             // info!(
@@ -236,7 +234,7 @@ async fn audio_processor(
             // 2. Calculate how many bytes will be left over again.
             // 3. Create a slice which holds all the bytes we wan't to process and send out in this pass
             n_bytes += leftover_bytes;
-            leftover_bytes = n_bytes % 12; // 12 = least common multiple of 3 and 4
+            leftover_bytes = n_bytes % 12; // 12 = least common multiple of 3 (one sample) and 4 (one dma buffer value)
             let work_slice_size = n_bytes - leftover_bytes;
             assert_eq!(work_slice_size % 4, 0);
             let work_slice = &mut in_buf[..work_slice_size];
@@ -256,7 +254,7 @@ async fn audio_processor(
             // The individual samples were already stored in the right format in the volume application step,
             // so we just copy from u8 slice to u32 slice in big endian format
             next_buf_size = work_slice_size / 4;
-            BigEndian::read_u32_into(work_slice, &mut back_buffer[..work_slice_size / 4]);
+            BigEndian::read_u32_into(work_slice, &mut back_buffer[..next_buf_size]);
 
             // Bytes have now been written to the outgoing buffer,
             // Copy any leftover bytes to the start of the incoming buffer.
@@ -297,6 +295,7 @@ async fn feedback_task(
     let mut prev_avg = 0;
     loop {
         let sample_rate = sample_rate.get().await;
+        // Nominal samples per packet
         let nominal_spp = sample_rate as f64 / 1000.0;
 
         let mut values = [0; FEEDBACK_RATE.frame_count()];
@@ -304,19 +303,19 @@ async fn feedback_task(
             *val = synch_feedback.wait().await.as_micros() as u32;
         }
         let sum: u32 = values.iter().sum();
-        let avg = sum / FEEDBACK_RATE.frame_count() as u32;
+        let avg_delay = sum / FEEDBACK_RATE.frame_count() as u32;
 
-        let delta = prev_avg as i16 - avg as i16;
-        prev_avg = avg;
+        let delta = prev_avg as i16 - avg_delay as i16;
+        prev_avg = avg_delay;
 
         info!(
             "Avg delay for last {} packets is {}us, {}us delta to previous",
             FEEDBACK_RATE.frame_count(),
-            avg,
+            avg_delay,
             delta
         );
 
-        if avg > 100 {
+        if avg_delay > 100 {
             // Packets arrive to late
             // Set to a faster rate...
             desired_spp = nominal_spp + 0.03;
@@ -328,7 +327,7 @@ async fn feedback_task(
             continue;
         }
 
-        if avg < 20 {
+        if avg_delay < 20 {
             // Packets arrive to early to determine a correct delta
             // Set to a slower rate...
             desired_spp = nominal_spp - 0.03;

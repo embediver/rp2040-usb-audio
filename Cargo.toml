@@ -47,11 +47,17 @@ fixed = "1.29"
 # embassy-rp = { git = "https://github.com/embediver/embassy.git", branch = "pio-i2s-bit-depth-config" }
 # embassy-usb = { git = "https://github.com/embediver/embassy.git", branch = "pio-i2s-bit-depth-config" }
 
-embassy-executor = { path = "../../code/embassy/embassy-executor" }
-embassy-sync = { path = "../../code/embassy/embassy-sync" }
-embassy-time = { path = "../../code/embassy/embassy-time" }
-embassy-rp = { path = "../../code/embassy/embassy-rp" }
-embassy-usb = { path = "../../code/embassy/embassy-usb" }
+# embassy-executor = { path = "../../code/embassy/embassy-executor" }
+# embassy-sync = { path = "../../code/embassy/embassy-sync" }
+# embassy-time = { path = "../../code/embassy/embassy-time" }
+# embassy-rp = { path = "../../code/embassy/embassy-rp" }
+# embassy-usb = { path = "../../code/embassy/embassy-usb" }
+
+embassy-executor = { git = "https://github.com/embassy-rs/embassy.git" }
+embassy-sync = { git = "https://github.com/embassy-rs/embassy.git" }
+embassy-time = { git = "https://github.com/embassy-rs/embassy.git" }
+embassy-rp = { git = "https://github.com/embassy-rs/embassy.git" }
+embassy-usb = { git = "https://github.com/embassy-rs/embassy.git" }
 
 [profile.release]
 debug = 2
