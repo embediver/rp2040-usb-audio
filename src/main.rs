@@ -31,9 +31,11 @@ use embassy_usb::{
 };
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
+#[cfg(feature = "lut_based_volume")]
 use proc_lut::lut_100;
 
 /// Look-up-table for factors from 0-100dB
+#[cfg(feature = "lut_based_volume")]
 const LUT_100DB: [u32; 101] = lut_100!();
 
 /// Maximum USB PCM Packet/Frame size (in bytes)
@@ -145,14 +147,14 @@ async fn main(spawner: Spawner) -> ! {
         let volume = audio_ctrl.volume(Channel::LeftFront);
         let rate = audio_ctrl.sample_rate_hz();
         match volume {
-            Some(Volume::Muted) => defmt::info!("Speaker is muted"),
+            Some(Volume::Muted) => info!("Speaker is muted"),
             Some(Volume::DeciBel(db)) => {
-                defmt::info!("Volume is {}dB", db);
+                info!("Volume is {}dB", db);
                 VOLUME.store(db.abs() as u8, core::sync::atomic::Ordering::Relaxed);
             }
             None => (),
         }
-        defmt::info!("Sample rate is {}", rate);
+        info!("Sample rate is {}", rate);
         if rate != 0 && rate != old_rate {
             old_rate = rate;
             SAMPLE_RATE.sender().send(rate);
@@ -197,7 +199,7 @@ async fn audio_processor(
             24,
             &program,
         );
-        defmt::info!("I2S set-up to {}Hz", current_rate);
+        info!("I2S set-up to {}Hz", current_rate);
 
         let mut leftover_bytes = 0;
 
@@ -206,7 +208,7 @@ async fn audio_processor(
         'inner: loop {
             if let Some(rate) = sample_rate.try_changed() {
                 current_rate = rate;
-                defmt::info!("Sample rate changed to {}Hz, restarting I2S...", rate);
+                info!("Sample rate changed to {}Hz, restarting I2S...", rate);
                 break 'inner;
             }
 
@@ -216,7 +218,7 @@ async fn audio_processor(
             let mut n_bytes = match stream.read_packet(&mut in_buf[leftover_bytes..]).await {
                 Ok(n) => n,
                 Err(e) => {
-                    defmt::info!("Stream read error: {}", e);
+                    info!("Stream read error: {}", e);
                     dma_future.await;
                     continue 'inner;
                 }
@@ -248,7 +250,7 @@ async fn audio_processor(
             // );
 
             let vol = volume.load(core::sync::atomic::Ordering::Relaxed);
-            convert_buf(work_slice, vol);
+            convert_and_attenuate_buf(work_slice, vol);
 
             // Incoming PCM data is little endian
             // b0:lo_L, b1:mid_L, b2:hi_L, b3:lo_R, b4:mid_R, b5:hi_R
@@ -309,12 +311,12 @@ async fn feedback_task(
         let delta = prev_avg as i16 - avg as i16;
         prev_avg = avg;
 
-        info!(
-            "Avg delay for last {} packets is {}us, {}us delta to previous",
-            FEEDBACK_RATE.frame_count(),
-            avg,
-            delta
-        );
+        // info!(
+        //     "Avg delay for last {} packets is {}us, {}us delta to previous",
+        //     FEEDBACK_RATE.frame_count(),
+        //     avg,
+        //     delta
+        // );
 
         if avg > 100 {
             // Packets arrive to late
@@ -351,7 +353,7 @@ async fn feedback_task(
         let d_us_pp = delta as f64 / FEEDBACK_RATE.frame_count() as f64;
         // desired samples per packet
         desired_spp += -0.3 * d_us_pp * samples_p_us(sample_rate as f64);
-        info!("Desired samples per packet should thus be {}", desired_spp);
+        // info!("Desired samples per packet should thus be {}", desired_spp);
 
         write_feedback(&mut feedback, desired_spp).await;
     }
@@ -395,12 +397,42 @@ fn create_usb_conf() -> Config<'static> {
 ///
 /// The volume (attenuation) has to be in dB from 0dB (no attenuation) to 100dB (maximum attenuation).
 #[inline]
-fn convert_buf(buf: &mut [u8], vol: u8) {
+#[cfg(feature = "lut_based_volume")]
+fn convert_and_attenuate_buf(buf: &mut [u8], vol: u8) {
     assert!(vol <= 100);
     for i in (0..buf.len()).step_by(3) {
         let mut sample = LittleEndian::read_i24(&buf[i..i + 3]);
         if LUT_100DB[vol as usize] != 1 {
             sample /= LUT_100DB[vol as usize] as i32;
+        }
+        BigEndian::write_i24(&mut buf[i..i + 3], sample);
+    }
+}
+
+/// Convert the buffer from 24bit PCM big- to little-endian and apply a attenuation
+///
+/// The volume (attenuation) has to be in dB from 0dB (no attenuation) to 192dB (maximum attenuation).
+/// Attenuation is applied in 3dB steps with shift operations.
+#[inline]
+#[cfg(not(feature = "lut_based_volume"))]
+fn convert_and_attenuate_buf(buf: &mut [u8], vol: u8) {
+    assert!(vol <= 192);
+
+    // 6dB attenuation equals a right shift of 1 (division by two)
+    // By shifting a second time and substracting the result from the first operation,
+    // a further 3dB attenuation can be archieved.
+
+    let steps_6db = vol / 6; // how many 6dB shifts to apply
+    let step_3db = vol % 6 >= 3; // how many 3dB shifts to apply
+
+    for i in (0..buf.len()).step_by(3) {
+        let mut sample = LittleEndian::read_i24(&buf[i..i + 3]);
+        if vol >= 3 {
+            let mut tmp = sample >> steps_6db;
+            if step_3db {
+                tmp -= sample >> 2;
+            }
+            sample = tmp;
         }
         BigEndian::write_i24(&mut buf[i..i + 3], sample);
     }
