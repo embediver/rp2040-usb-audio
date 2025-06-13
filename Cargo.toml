@@ -32,6 +32,8 @@ embassy-sync = { version = "0.6" }
 embassy-time = { version = "0.4", features = ["defmt", "defmt-timestamp-uptime"] }
 embassy-rp = { version = "0.4", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp2040"] }
 embassy-usb = "0.4.0"
+embassy-futures = "0.1.1"
+
 static_cell = "2.1"
 portable-atomic = { version = "1.11", features = ["critical-section"] }
 
@@ -40,24 +42,15 @@ byteorder = { version = "1.5", default-features = false }
 
 fixed = "1.29"
 
+usbd-hid = { version = "0.8.2", optional = true }
+
 [patch.crates-io]
-# embassy-executor = { git = "https://github.com/embediver/embassy.git", branch = "pio-i2s-bit-depth-config" }
-# embassy-sync = { git = "https://github.com/embediver/embassy.git", branch = "pio-i2s-bit-depth-config" }
-# embassy-time = { git = "https://github.com/embediver/embassy.git", branch = "pio-i2s-bit-depth-config" }
-# embassy-rp = { git = "https://github.com/embediver/embassy.git", branch = "pio-i2s-bit-depth-config" }
-# embassy-usb = { git = "https://github.com/embediver/embassy.git", branch = "pio-i2s-bit-depth-config" }
-
-# embassy-executor = { path = "../../code/embassy/embassy-executor" }
-# embassy-sync = { path = "../../code/embassy/embassy-sync" }
-# embassy-time = { path = "../../code/embassy/embassy-time" }
-# embassy-rp = { path = "../../code/embassy/embassy-rp" }
-# embassy-usb = { path = "../../code/embassy/embassy-usb" }
-
 embassy-executor = { git = "https://github.com/embassy-rs/embassy.git" }
 embassy-sync = { git = "https://github.com/embassy-rs/embassy.git" }
 embassy-time = { git = "https://github.com/embassy-rs/embassy.git" }
 embassy-rp = { git = "https://github.com/embassy-rs/embassy.git" }
 embassy-usb = { git = "https://github.com/embassy-rs/embassy.git" }
+embassy-futures = { git = "https://github.com/embassy-rs/embassy.git" }
 
 [profile.release]
 debug = 2
@@ -71,3 +64,4 @@ opt-level = "z"
 
 [features]
 lut_based_volume = []
+hid = [ "dep:usbd-hid" ]

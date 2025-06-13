@@ -34,6 +34,9 @@ use byteorder::{BigEndian, ByteOrder, LittleEndian};
 #[cfg(feature = "lut_based_volume")]
 use proc_lut::lut_100;
 
+#[cfg(feature = "hid")]
+mod hid;
+
 /// Look-up-table for factors from 0-100dB
 #[cfg(feature = "lut_based_volume")]
 const LUT_100DB: [u32; 101] = lut_100!();
@@ -113,6 +116,23 @@ async fn main(spawner: Spawner) -> ! {
         &[Channel::LeftFront, Channel::RightFront],
         FEEDBACK_RATE,
     );
+
+    #[cfg(feature = "hid")]
+    {
+        use embassy_usb::class::hid::{HidWriter, State};
+
+        static HID_STATE: StaticCell<State> = StaticCell::new();
+
+        let hid: hid::RpHidWriter = HidWriter::new(
+            &mut usb_builder,
+            HID_STATE.init(State::new()),
+            crate::hid::hid_config(),
+        );
+
+        let inputs = hid::Inputs::new(p.PIN_13, p.PIN_18);
+
+        spawner.must_spawn(hid::hid_task(inputs, hid));
+    }
 
     let usb = usb_builder.build();
 

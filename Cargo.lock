@@ -1160,6 +1160,7 @@ dependencies = [
  "defmt 0.3.100",
  "defmt-rtt",
  "embassy-executor",
+ "embassy-futures",
  "embassy-rp",
  "embassy-sync 0.6.2",
  "embassy-time",
@@ -1174,6 +1175,7 @@ dependencies = [
  "portable-atomic",
  "proc-lut",
  "static_cell",
+ "usbd-hid",
 ]
 
 [[package]]
