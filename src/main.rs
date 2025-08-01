@@ -7,6 +7,8 @@ use defmt::info;
 use embassy_executor::Spawner;
 use embassy_rp::{
     Peri, bind_interrupts,
+    clocks::Gpout,
+    gpio::Output,
     peripherals::{PIO0, USB},
     pio::Pio,
     pio_programs::i2s::{PioI2sOut, PioI2sOutProgram},
@@ -36,6 +38,9 @@ use proc_lut::lut_100;
 
 #[cfg(feature = "hid")]
 mod hid;
+
+const PRODUCT_STRING: &str = "TAS5701 Amplifier";
+const MANUFACTURER_STRING: &str = "RT-CUSTOMZ";
 
 /// Look-up-table for factors from 0-100dB
 #[cfg(feature = "lut_based_volume")]
@@ -71,9 +76,9 @@ bind_interrupts!(struct PioIrqs {
 // Pinout: GP0, GP1, GND, GP2, .., GP5, GND, GP6, GP7, GP8
 //         1,   2, ...                  8,   9,   10,  11
 struct I2SPeripherals {
-    bit_clock_pin: Peri<'static, embassy_rp::peripherals::PIN_6>,
-    left_right_clock_pin: Peri<'static, embassy_rp::peripherals::PIN_7>,
-    data_pin: Peri<'static, embassy_rp::peripherals::PIN_8>,
+    bit_clock_pin: Peri<'static, embassy_rp::peripherals::PIN_5>,
+    left_right_clock_pin: Peri<'static, embassy_rp::peripherals::PIN_6>,
+    data_pin: Peri<'static, embassy_rp::peripherals::PIN_4>,
     dma_channel: Peri<'static, embassy_rp::peripherals::DMA_CH0>,
     pio0: Peri<'static, embassy_rp::peripherals::PIO0>,
 }
@@ -83,12 +88,19 @@ async fn main(spawner: Spawner) -> ! {
     let p = embassy_rp::init(Default::default());
 
     let i2s_peri = I2SPeripherals {
-        bit_clock_pin: p.PIN_6,
-        left_right_clock_pin: p.PIN_7,
-        data_pin: p.PIN_8,
+        bit_clock_pin: p.PIN_5,
+        left_right_clock_pin: p.PIN_6,
+        data_pin: p.PIN_4,
         dma_channel: p.DMA_CH0,
         pio0: p.PIO0,
     };
+
+    let mut unmute = Output::new(p.PIN_9, embassy_rp::gpio::Level::Low);
+    let mclk_out = Gpout::new(p.PIN_21);
+    mclk_out.set_src(embassy_rp::clocks::GpoutSrc::Xosc);
+    mclk_out.set_div(1, 0);
+    info!("MCLK set to {}Hz", mclk_out.get_freq());
+    mclk_out.enable();
 
     static UAC_STATE: StaticCell<State> = StaticCell::new();
 
@@ -158,6 +170,8 @@ async fn main(spawner: Spawner) -> ! {
         &SYNCH_FEEDBACK,
         i2s_peri,
     ));
+
+    unmute.set_high();
 
     let mut old_rate = 0;
     loop {
@@ -407,8 +421,8 @@ const fn samples_p_us(sample_rate_hz: f64) -> f64 {
 
 fn create_usb_conf() -> Config<'static> {
     let mut conf = Config::new(0x4242, 0x1234);
-    conf.product = Some("RP2040 Soundcard");
-    conf.manufacturer = Some("RT-CUSTOMZ");
+    conf.product = Some(PRODUCT_STRING);
+    conf.manufacturer = Some(MANUFACTURER_STRING);
     conf
 }
 
