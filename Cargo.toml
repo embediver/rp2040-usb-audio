@@ -64,4 +64,6 @@ opt-level = "z"
 
 [features]
 lut_based_volume = []
+hid_buttons = [ "hid" ]
+hid_rotary = [ "hid" ]
 hid = [ "dep:usbd-hid" ]

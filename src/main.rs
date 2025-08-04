@@ -34,8 +34,17 @@ use byteorder::{BigEndian, ByteOrder, LittleEndian};
 #[cfg(feature = "lut_based_volume")]
 use proc_lut::lut_100;
 
-#[cfg(feature = "hid")]
-mod hid;
+#[cfg(all(feature = "hid_buttons", feature = "hid_rotary"))]
+compile_error!("Only one of the features 'hid_buttons', 'hid_rotary' may be activated.");
+
+#[cfg(feature = "hid_buttons")]
+mod hid_button;
+#[cfg(feature = "hid_buttons")]
+use hid_button as hid;
+#[cfg(feature = "hid_rotary")]
+mod hid_rotary;
+#[cfg(feature = "hid_rotary")]
+use hid_rotary as hid;
 
 /// Look-up-table for factors from 0-100dB
 #[cfg(feature = "lut_based_volume")]
@@ -71,9 +80,9 @@ bind_interrupts!(struct PioIrqs {
 // Pinout: GP0, GP1, GND, GP2, .., GP5, GND, GP6, GP7, GP8
 //         1,   2, ...                  8,   9,   10,  11
 struct I2SPeripherals {
-    bit_clock_pin: Peri<'static, embassy_rp::peripherals::PIN_6>,
-    left_right_clock_pin: Peri<'static, embassy_rp::peripherals::PIN_7>,
-    data_pin: Peri<'static, embassy_rp::peripherals::PIN_8>,
+    bit_clock_pin: Peri<'static, embassy_rp::peripherals::PIN_2>,
+    left_right_clock_pin: Peri<'static, embassy_rp::peripherals::PIN_3>,
+    data_pin: Peri<'static, embassy_rp::peripherals::PIN_4>,
     dma_channel: Peri<'static, embassy_rp::peripherals::DMA_CH0>,
     pio0: Peri<'static, embassy_rp::peripherals::PIO0>,
 }
@@ -83,9 +92,9 @@ async fn main(spawner: Spawner) -> ! {
     let p = embassy_rp::init(Default::default());
 
     let i2s_peri = I2SPeripherals {
-        bit_clock_pin: p.PIN_6,
-        left_right_clock_pin: p.PIN_7,
-        data_pin: p.PIN_8,
+        bit_clock_pin: p.PIN_2,
+        left_right_clock_pin: p.PIN_3,
+        data_pin: p.PIN_4,
         dma_channel: p.DMA_CH0,
         pio0: p.PIO0,
     };
@@ -129,7 +138,7 @@ async fn main(spawner: Spawner) -> ! {
             crate::hid::hid_config(),
         );
 
-        let inputs = hid::Inputs::new(p.PIN_13, p.PIN_18);
+        let inputs = hid::Inputs::new(p.PIN_8, p.PIN_9, p.PIN_10, p.PIO1);
 
         spawner.must_spawn(hid::hid_task(inputs, hid));
     }
