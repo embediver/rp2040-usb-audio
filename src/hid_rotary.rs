@@ -1,5 +1,10 @@
-use embassy_futures::select::{Either, select};
-use embassy_rp::{Peri, bind_interrupts, gpio::Input, peripherals::PIO1, pio::Pio};
+use embassy_futures::select::{Either, Either3, select, select3};
+use embassy_rp::{
+    Peri, bind_interrupts,
+    gpio::{AnyPin, Input},
+    peripherals::PIO1,
+    pio::Pio,
+};
 use embassy_time::Delay;
 use embassy_usb::class::hid::{Config, HidWriter};
 use embedded_hal_async::delay::DelayNs;
@@ -9,6 +14,7 @@ pub struct Inputs {
     rotary_a: Peri<'static, embassy_rp::peripherals::PIN_8>,
     rotary_b: Peri<'static, embassy_rp::peripherals::PIN_9>,
     rotary_sw: Input<'static>,
+    button: Option<Input<'static>>,
     pio: Peri<'static, embassy_rp::peripherals::PIO1>,
 }
 
@@ -20,21 +26,20 @@ bind_interrupts!(struct PioIrqs {
 
 impl Inputs {
     /// Create a new input configuration from pins
-    ///
-    /// Configures the switch pin with schmitt-trigger, no pull.
     pub fn new(
         rotary_a: Peri<'static, embassy_rp::peripherals::PIN_8>,
         rotary_b: Peri<'static, embassy_rp::peripherals::PIN_9>,
         rotary_sw: Peri<'static, embassy_rp::peripherals::PIN_10>,
+        button: Option<Peri<'static, AnyPin>>,
         pio1: Peri<'static, PIO1>,
     ) -> Inputs {
-        let mut inp = Inputs {
+        let inp = Inputs {
             rotary_a,
             rotary_b,
             rotary_sw: Input::new(rotary_sw, embassy_rp::gpio::Pull::None),
+            button: button.map(|b| Input::new(b, embassy_rp::gpio::Pull::None)),
             pio: pio1,
         };
-        inp.rotary_sw.set_schmitt(true);
         inp
     }
 }
@@ -51,6 +56,9 @@ const VOL_DOWN_REPORT: MediaKeyboardReport = MediaKeyboardReport {
 const PLAY_PAUSE_REPORT: MediaKeyboardReport = MediaKeyboardReport {
     usage_id: MediaKey::PlayPause as u16,
 };
+const NEXT_TRACK_REPORT: MediaKeyboardReport = MediaKeyboardReport {
+    usage_id: MediaKey::NextTrack as u16,
+};
 const NO_MEDIA_KEY_PRESSED: MediaKeyboardReport = MediaKeyboardReport {
     usage_id: MediaKey::Zero as u16,
 };
@@ -62,6 +70,11 @@ pub async fn hid_task(inputs: Inputs, mut hid_writer: RpHidWriter) -> ! {
     hid_writer.ready().await;
 
     let mut rotary_sw = inputs.rotary_sw;
+    let mut button = inputs.button;
+    rotary_sw.set_schmitt(true);
+    if let Some(ref mut b) = button {
+        b.set_schmitt(true);
+    }
 
     let Pio {
         mut common, sm0, ..
@@ -76,9 +89,17 @@ pub async fn hid_task(inputs: Inputs, mut hid_writer: RpHidWriter) -> ! {
     );
 
     loop {
-        let (rotary, sw) = match select(rot_pio.read(), rotary_sw.wait_for_low()).await {
-            Either::First(d) => (Some(d), false),
-            Either::Second(_) => (None, true),
+        let (rotary, sw, btn_event) = if let Some(ref mut b) = button {
+            match select3(rot_pio.read(), rotary_sw.wait_for_low(), b.wait_for_low()).await {
+                Either3::First(d) => (Some(d), false, false),
+                Either3::Second(_) => (None, true, false),
+                Either3::Third(_) => (None, false, true),
+            }
+        } else {
+            match select(rot_pio.read(), rotary_sw.wait_for_low()).await {
+                Either::First(d) => (Some(d), false, false),
+                Either::Second(_) => (None, true, false),
+            }
         };
 
         if let Some(Direction::Clockwise) = rotary {
@@ -112,6 +133,22 @@ pub async fn hid_task(inputs: Inputs, mut hid_writer: RpHidWriter) -> ! {
                 .write_serialize(&NO_MEDIA_KEY_PRESSED)
                 .await
                 .unwrap();
+            Delay.delay_ms(100).await;
+        }
+
+        if btn_event {
+            info!("Button pressed");
+            hid_writer
+                .write_serialize(&NEXT_TRACK_REPORT)
+                .await
+                .unwrap();
+            rotary_sw.wait_for_high().await;
+            info!("Button released");
+            hid_writer
+                .write_serialize(&NO_MEDIA_KEY_PRESSED)
+                .await
+                .unwrap();
+            Delay.delay_ms(100).await;
         }
     }
 }

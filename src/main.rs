@@ -138,7 +138,7 @@ async fn main(spawner: Spawner) -> ! {
             crate::hid::hid_config(),
         );
 
-        let inputs = hid::Inputs::new(p.PIN_8, p.PIN_9, p.PIN_10, p.PIO1);
+        let inputs = hid::Inputs::new(p.PIN_8, p.PIN_9, p.PIN_10, None, p.PIO1);
 
         spawner.must_spawn(hid::hid_task(inputs, hid));
     }
@@ -418,6 +418,7 @@ fn create_usb_conf() -> Config<'static> {
     let mut conf = Config::new(0x4242, 0x1234);
     conf.product = Some("RP2040 Soundcard");
     conf.manufacturer = Some("RT-CUSTOMZ");
+    conf.max_power = 400;
     conf
 }
 
