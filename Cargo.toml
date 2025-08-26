@@ -16,7 +16,7 @@ bench = false
 [dependencies]
 defmt = "0.3"
 defmt-rtt = "0.4"
-panic-probe = { version = "0.3", features = ["print-defmt"] }
+panic-probe = { version = "0.3", features = ["print-defmt"], optional = true }
 
 embedded-hal = "1.0.0"
 embedded-hal-async = "1.0.0"
@@ -63,7 +63,10 @@ lto = true
 opt-level = "z"
 
 [features]
+default = [ "panic_probe" ]
 lut_based_volume = []
 hid_buttons = [ "hid" ]
 hid_rotary = [ "hid" ]
 hid = [ "dep:usbd-hid" ]
+# Disabling `panic_probe` switches to reset on panic panic-handler
+panic_probe = [ "dep:panic-probe" ]

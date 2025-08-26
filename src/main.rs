@@ -4,6 +4,7 @@
 use core::{mem, sync::atomic::AtomicU8};
 
 use defmt::info;
+use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_rp::{
     Peri, bind_interrupts,
@@ -13,8 +14,9 @@ use embassy_rp::{
     usb::{self, Driver},
 };
 use embassy_time::{Duration, Instant};
+#[cfg(feature = "panic_probe")]
+use panic_probe as _;
 use static_cell::StaticCell;
-use {defmt_rtt as _, panic_probe as _};
 
 use embassy_sync::signal::Signal;
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, watch};
@@ -87,6 +89,12 @@ struct I2SPeripherals {
     pio0: Peri<'static, embassy_rp::peripherals::PIO0>,
 }
 
+#[cfg(not(feature = "panic_probe"))]
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    cortex_m::peripheral::SCB::sys_reset();
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) -> ! {
     let p = embassy_rp::init(Default::default());
@@ -138,7 +146,7 @@ async fn main(spawner: Spawner) -> ! {
             crate::hid::hid_config(),
         );
 
-        let inputs = hid::Inputs::new(p.PIN_8, p.PIN_9, p.PIN_10, None, p.PIO1);
+        let inputs = hid::Inputs::new(p.PIN_8, p.PIN_9, p.PIN_10, Some(p.PIN_11.into()), p.PIO1);
 
         spawner.must_spawn(hid::hid_task(inputs, hid));
     }
@@ -250,7 +258,15 @@ async fn audio_processor(
                     continue 'inner;
                 }
             };
-            assert_eq!(n_bytes % 6, 0); // sanity check if we got an equal amount of left and right samples with 24bit each
+            // sanity check if we got an equal amount of left and right samples with 24bit each
+            // TODO: this apparently triggers sometimes, find out why.
+            //       Can a packet end with a uneven number of samples
+            //       and thus miss a sample for one of the channels?
+            //       Will the next packet start with the missing sample?
+            //       For now this will panic (and reset the chip if the panic-reset panic-handler is used,
+            //       `panic_probe` feature disabled).
+            assert_eq!(n_bytes % 6, 0);
+
             let usb_packet_delay = i2s_start_time.elapsed();
             synch_feedback.signal(usb_packet_delay);
             // info!(
