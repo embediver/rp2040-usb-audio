@@ -144,7 +144,7 @@ async fn main(spawner: Spawner) -> ! {
             crate::hid::hid_config(),
         );
 
-        let inputs = hid::Inputs::new(p.PIN_13, p.PIN_19);
+        let inputs = hid::Inputs::rew(p.PIN_13, p.PIN_19);
 
         spawner.must_spawn(hid::hid_task(inputs, hid));
     }
@@ -202,6 +202,8 @@ async fn tas_reset(mut nreset: Output<'static>) {
     embassy_time::Timer::after(embassy_time::Duration::from_millis(10)).await;
     nreset.set_high();
     info!("nreset now high!");
+    let pending = core::future::pending();
+    let () = pending.await;
 }
 
 #[embassy_executor::task]
