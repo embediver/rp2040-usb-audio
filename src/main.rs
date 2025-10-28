@@ -71,6 +71,9 @@ const FEEDBACK_RATE: FeedbackRefresh = FeedbackRefresh::Period32Frames;
 // TODO: While 96kHz works, the performance budget is a litle tight.
 const SUPPORTED_SAMPLE_RATES: [u32; 3] = [44100, 48000, 96000];
 
+/// Timeout after which the DAC gets muted when no data arrived
+const PACKET_TIMEOUT_US: u64 = 900;
+
 bind_interrupts!(struct UsbIrqs {
     USBCTRL_IRQ => usb::InterruptHandler<embassy_rp::peripherals::USB>;
 });
@@ -87,6 +90,7 @@ struct I2SPeripherals {
     data_pin: Peri<'static, embassy_rp::peripherals::PIN_4>,
     dma_channel: Peri<'static, embassy_rp::peripherals::DMA_CH0>,
     pio0: Peri<'static, embassy_rp::peripherals::PIO0>,
+    mute: Peri<'static, embassy_rp::peripherals::PIN_1>,
 }
 
 #[cfg(not(feature = "panic_probe"))]
@@ -105,6 +109,7 @@ async fn main(spawner: Spawner) -> ! {
         data_pin: p.PIN_4,
         dma_channel: p.DMA_CH0,
         pio0: p.PIO0,
+        mute: p.PIN_1,
     };
 
     static UAC_STATE: StaticCell<State> = StaticCell::new();
@@ -205,6 +210,9 @@ async fn audio_processor(
     synch_feedback: &'static Signal<ThreadModeRawMutex, Duration>,
     mut i2s_peri: I2SPeripherals,
 ) -> ! {
+    // Activate DAC mute
+    let mut not_mute = embassy_rp::gpio::Output::new(i2s_peri.mute, embassy_rp::gpio::Level::Low);
+
     stream.wait_connection().await;
     let mut current_rate = sample_rate.get().await;
 
@@ -240,20 +248,42 @@ async fn audio_processor(
 
         // process audio data until sample-rate changes
         let mut next_buf_size = 0;
+        let mut data_good = false;
         'inner: loop {
             if let Some(rate) = sample_rate.try_changed() {
                 current_rate = rate;
                 info!("Sample rate changed to {}Hz, restarting I2S...", rate);
+                not_mute.set_low();
                 break 'inner;
             }
 
             let dma_future = i2s.write(&front_buffer[..next_buf_size]);
             let i2s_start_time = Instant::now();
+            if data_good {
+                // In case of good data, unmute after transfer is started
+                not_mute.set_high();
+            }
 
-            let mut n_bytes = match stream.read_packet(&mut in_buf[leftover_bytes..]).await {
+            let watch_dog_timer =
+                embassy_time::Timer::after(Duration::from_micros(PACKET_TIMEOUT_US));
+            let packet_result = match embassy_futures::select::select(
+                stream.read_packet(&mut in_buf[leftover_bytes..]),
+                watch_dog_timer,
+            )
+            .await
+            {
+                embassy_futures::select::Either::First(p) => p,
+                embassy_futures::select::Either::Second(_) => {
+                    not_mute.set_low();
+                    dma_future.await;
+                    continue 'inner;
+                }
+            };
+            let mut n_bytes = match packet_result {
                 Ok(n) => n,
                 Err(e) => {
                     info!("Stream read error: {}", e);
+                    not_mute.set_low();
                     dma_future.await;
                     continue 'inner;
                 }
@@ -263,9 +293,20 @@ async fn audio_processor(
             //       Can a packet end with a uneven number of samples
             //       and thus miss a sample for one of the channels?
             //       Will the next packet start with the missing sample?
-            //       For now this will panic (and reset the chip if the panic-reset panic-handler is used,
-            //       `panic_probe` feature disabled).
-            assert_eq!(n_bytes % 6, 0);
+            //
+            // Use assert to panic (and reset the chip if the panic-reset panic-handler is used,
+            //    `panic_probe` feature disabled).
+            // assert_eq!(n_bytes % 6, 0);
+
+            // Or try to mute and wait for a good packet
+            if n_bytes % 6 == 0 {
+                // Data good
+                data_good = true;
+            } else {
+                // Funny amount of bytes received
+                not_mute.set_low(); // instantly mute
+                data_good = false;
+            }
 
             let usb_packet_delay = i2s_start_time.elapsed();
             synch_feedback.signal(usb_packet_delay);
