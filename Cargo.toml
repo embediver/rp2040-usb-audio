@@ -63,7 +63,7 @@ lto = true
 opt-level = "z"
 
 [features]
-default = []
+default = ["lut_based_volume"]
 lut_based_volume = []
 hid_buttons = [ "hid" ]
 hid_rotary = [ "hid" ]

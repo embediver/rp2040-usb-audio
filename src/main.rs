@@ -262,7 +262,6 @@ async fn audio_processor(
             if data_good {
                 // In case of good data, unmute after transfer is started
                 not_mute.set_high();
-                info!("Unmute");
             }
 
             let watch_dog_timer =
