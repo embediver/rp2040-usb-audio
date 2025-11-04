@@ -262,6 +262,7 @@ async fn audio_processor(
             if data_good {
                 // In case of good data, unmute after transfer is started
                 not_mute.set_high();
+                info!("Unmute");
             }
 
             let watch_dog_timer =
@@ -274,6 +275,7 @@ async fn audio_processor(
             {
                 embassy_futures::select::Either::First(p) => p,
                 embassy_futures::select::Either::Second(_) => {
+                    info!("Mute (packet timeout)");
                     not_mute.set_low();
                     dma_future.await;
                     continue 'inner;
@@ -306,6 +308,7 @@ async fn audio_processor(
                 // Funny amount of bytes received
                 not_mute.set_low(); // instantly mute
                 data_good = false;
+                info!("mute (malformed packet)")
             }
 
             let usb_packet_delay = i2s_start_time.elapsed();
