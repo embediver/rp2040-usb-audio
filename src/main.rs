@@ -6,6 +6,8 @@ use core::{mem, sync::atomic::AtomicU8};
 use defmt::info;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
+#[cfg(feature = "power_control")]
+use embassy_rp::gpio::Output;
 use embassy_rp::{
     Peri, bind_interrupts,
     peripherals::{PIO0, USB},
@@ -95,13 +97,16 @@ struct I2SPeripherals {
 
 #[cfg(not(feature = "panic_probe"))]
 #[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
+fn panic(_info: &core::panic::PanicInfo) -> ! {
     cortex_m::peripheral::SCB::sys_reset();
 }
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) -> ! {
     let p = embassy_rp::init(Default::default());
+
+    #[cfg(feature = "power_control")]
+    let mut amp_power = Output::new(p.PIN_19, embassy_rp::gpio::Level::Low);
 
     let i2s_peri = I2SPeripherals {
         bit_clock_pin: p.PIN_2,
@@ -162,6 +167,9 @@ async fn main(spawner: Spawner) -> ! {
 
     feedback.wait_connection().await;
     audio_stream.wait_connection().await;
+
+    #[cfg(feature = "power_control")]
+    amp_power.set_high();
 
     static VOLUME: AtomicU8 = AtomicU8::new(0);
     static SAMPLE_RATE: watch::Watch<ThreadModeRawMutex, u32, 2> = watch::Watch::new();
@@ -306,8 +314,8 @@ async fn audio_processor(
             } else {
                 // Funny amount of bytes received
                 not_mute.set_low(); // instantly mute
-                data_good = false;
-                info!("mute (malformed packet)")
+                // data_good = false;
+                panic!("malformed packet");
             }
 
             let usb_packet_delay = i2s_start_time.elapsed();

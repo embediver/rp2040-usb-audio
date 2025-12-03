@@ -63,10 +63,11 @@ lto = true
 opt-level = "z"
 
 [features]
-default = ["lut_based_volume"]
+default = ["lut_based_volume", "power_control"]
 lut_based_volume = []
 hid_buttons = [ "hid" ]
 hid_rotary = [ "hid" ]
 hid = [ "dep:usbd-hid" ]
 # Disabling `panic_probe` switches to reset on panic panic-handler
 panic_probe = [ "dep:panic-probe" ]
+power_control = []
