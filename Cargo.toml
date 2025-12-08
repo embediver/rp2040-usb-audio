@@ -3,13 +3,13 @@ members = ["proc-lut"]
 
 [package]
 edition = "2024"
-name = "rp2040-soundcard"
+name = "rp2040-usb-audio"
 version = "0.1.0"
 authors = ["Marvin Gudel <github.marvin@gudel.org>"]
 resolver = "2"
 
 [[bin]]
-name = "rp2040-soundcard"
+name = "rp2040-usb-audio"
 test = false
 bench = false
 
