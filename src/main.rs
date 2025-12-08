@@ -125,7 +125,7 @@ async fn main(spawner: Spawner) -> ! {
         static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
         Builder::new(
             usb_driver,
-            create_usb_conf(),
+            create_usb_conf(p.FLASH),
             CONFIG_DESCRIPTOR.init([0; 256]),
             BOS_DESCRIPTOR.init([0; 256]),
             &mut [],
@@ -497,10 +497,25 @@ const fn samples_p_us(sample_rate_hz: f64) -> f64 {
     sample_rate_hz / 1_000_000.
 }
 
-fn create_usb_conf() -> Config<'static> {
+fn create_usb_conf(flash: Peri<'static, embassy_rp::peripherals::FLASH>) -> Config<'static> {
+    use embassy_rp::flash::Flash;
+    use embassy_sync::once_lock::OnceLock;
+    let mut flash: Flash<'_, _, _, 0> = Flash::new_blocking(flash);
+    let mut serial = [0; 16];
+    let serial_ok = flash.blocking_unique_id(&mut serial).is_ok();
+    static SERIAL_STR_BUF: OnceLock<[u8; 8]> = OnceLock::new();
+    let serial_str = SERIAL_STR_BUF.get_or_init(|| {
+        let mut tmp = [0; 8];
+        const_hex::encode_to_str_upper(&serial[12..], &mut tmp).unwrap();
+        tmp
+    });
+
     let mut conf = Config::new(0x4242, 0x1234);
     conf.product = Some("RP2040 Soundcard");
     conf.manufacturer = Some("RT-CUSTOMZ");
+    if serial_ok {
+        conf.serial_number = Some(str::from_utf8(serial_str).unwrap())
+    }
     conf.max_power = 400;
     conf
 }
