@@ -6,7 +6,6 @@ use core::{mem, sync::atomic::AtomicU8};
 use defmt::info;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-#[cfg(feature = "power_control")]
 use embassy_rp::gpio::Output;
 use embassy_rp::{
     Peri, bind_interrupts,
@@ -178,6 +177,10 @@ async fn main(spawner: Spawner) -> ! {
         SAMPLE_RATE.dyn_receiver().unwrap(),
     ));
 
+    #[cfg(feature = "power_control")]
+    let amp_power = Some(amp_power);
+    #[cfg(not(feature = "power_control"))]
+    let amp_power = None;
     spawner.must_spawn(audio_processor(
         audio_stream,
         &VOLUME,
@@ -215,7 +218,7 @@ async fn audio_processor(
     mut sample_rate: watch::DynReceiver<'static, u32>,
     synch_feedback: &'static Signal<ThreadModeRawMutex, Duration>,
     mut i2s_peri: I2SPeripherals,
-    mut amp_power: Output<'static>,
+    mut amp_power: Option<Output<'static>>,
 ) -> ! {
     // Activate DAC mute
     let mut not_mute = embassy_rp::gpio::Output::new(i2s_peri.mute, embassy_rp::gpio::Level::Low);
@@ -271,8 +274,9 @@ async fn audio_processor(
                 if not_mute.is_set_low() {
                     info!("Unmute");
                 }
-                #[cfg(feature = "power_control")]
-                amp_power.set_high();
+                if let Some(ref mut p) = amp_power {
+                    p.set_high();
+                }
                 not_mute.set_high();
             }
 
@@ -293,8 +297,9 @@ async fn audio_processor(
                     not_mute.set_low();
                     dma_future.await;
 
-                    #[cfg(feature = "power_control")]
-                    amp_power.set_low();
+                    if let Some(ref mut p) = amp_power {
+                        p.set_low();
+                    }
 
                     continue 'inner;
                 }
@@ -326,7 +331,7 @@ async fn audio_processor(
                 // Funny amount of bytes received
                 not_mute.set_low(); // instantly mute
                 // data_good = false;
-                panic!("malformed packet");
+                panic!("malformed packet (received {} bytes)", n_bytes);
             }
 
             let usb_packet_delay = i2s_start_time.elapsed();
