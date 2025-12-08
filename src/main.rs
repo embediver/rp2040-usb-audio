@@ -106,7 +106,7 @@ async fn main(spawner: Spawner) -> ! {
     let p = embassy_rp::init(Default::default());
 
     #[cfg(feature = "power_control")]
-    let mut amp_power = Output::new(p.PIN_19, embassy_rp::gpio::Level::Low);
+    let amp_power = Output::new(p.PIN_19, embassy_rp::gpio::Level::Low);
 
     let i2s_peri = I2SPeripherals {
         bit_clock_pin: p.PIN_2,
@@ -168,9 +168,6 @@ async fn main(spawner: Spawner) -> ! {
     feedback.wait_connection().await;
     audio_stream.wait_connection().await;
 
-    #[cfg(feature = "power_control")]
-    amp_power.set_high();
-
     static VOLUME: AtomicU8 = AtomicU8::new(0);
     static SAMPLE_RATE: watch::Watch<ThreadModeRawMutex, u32, 2> = watch::Watch::new();
     static SYNCH_FEEDBACK: Signal<ThreadModeRawMutex, Duration> = Signal::new();
@@ -187,6 +184,7 @@ async fn main(spawner: Spawner) -> ! {
         SAMPLE_RATE.dyn_receiver().unwrap(),
         &SYNCH_FEEDBACK,
         i2s_peri,
+        amp_power,
     ));
 
     let mut old_rate = 0;
@@ -217,6 +215,7 @@ async fn audio_processor(
     mut sample_rate: watch::DynReceiver<'static, u32>,
     synch_feedback: &'static Signal<ThreadModeRawMutex, Duration>,
     mut i2s_peri: I2SPeripherals,
+    mut amp_power: Output<'static>,
 ) -> ! {
     // Activate DAC mute
     let mut not_mute = embassy_rp::gpio::Output::new(i2s_peri.mute, embassy_rp::gpio::Level::Low);
@@ -269,6 +268,11 @@ async fn audio_processor(
             let i2s_start_time = Instant::now();
             if data_good {
                 // In case of good data, unmute after transfer is started
+                if not_mute.is_set_low() {
+                    info!("Unmute");
+                }
+                #[cfg(feature = "power_control")]
+                amp_power.set_high();
                 not_mute.set_high();
             }
 
@@ -282,9 +286,16 @@ async fn audio_processor(
             {
                 embassy_futures::select::Either::First(p) => p,
                 embassy_futures::select::Either::Second(_) => {
-                    info!("Mute (packet timeout)");
+                    data_good = false;
+                    if not_mute.is_set_high() {
+                        info!("Mute (packet timeout)");
+                    }
                     not_mute.set_low();
                     dma_future.await;
+
+                    #[cfg(feature = "power_control")]
+                    amp_power.set_low();
+
                     continue 'inner;
                 }
             };
@@ -417,7 +428,7 @@ async fn feedback_task(
             // Packets arrive to late
             // Set to a faster rate...
             desired_spp = nominal_spp + 0.03;
-            defmt::warn!(
+            defmt::debug!(
                 "Packets arrive to late, setting spp hard to {}spp",
                 desired_spp
             );
@@ -429,7 +440,7 @@ async fn feedback_task(
             // Packets arrive to early to determine a correct delta
             // Set to a slower rate...
             desired_spp = nominal_spp - 0.03;
-            defmt::warn!(
+            defmt::debug!(
                 "Packets arive to early, setting spp hard to {}spp",
                 desired_spp
             );
@@ -438,7 +449,7 @@ async fn feedback_task(
         }
 
         if delta > 200 {
-            defmt::warn!("Found delta greater than 100us, skipping feedback!");
+            defmt::debug!("Found delta greater than 100us, skipping feedback!");
             continue;
         }
 
