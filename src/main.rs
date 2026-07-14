@@ -97,6 +97,8 @@ async fn main(spawner: Spawner) -> ! {
 
     let mut unmute = Output::new(p.PIN_9, embassy_rp::gpio::Level::Low);
     let nreset = Output::new(p.PIN_19, embassy_rp::gpio::Level::Low);
+
+    // MCLK out
     let mclk_out = Gpout::new(p.PIN_21);
     mclk_out.set_src(embassy_rp::clocks::GpoutSrc::Xosc);
     mclk_out.set_div(1, 0);
@@ -144,7 +146,7 @@ async fn main(spawner: Spawner) -> ! {
             crate::hid::hid_config(),
         );
 
-        let inputs = hid::Inputs::rew(p.PIN_13, p.PIN_19);
+        let inputs = hid::Inputs::new(p.PIN_13, p.PIN_19);
 
         spawner.must_spawn(hid::hid_task(inputs, hid));
     }
@@ -199,7 +201,7 @@ async fn main(spawner: Spawner) -> ! {
 
 #[embassy_executor::task]
 async fn tas_reset(mut nreset: Output<'static>) {
-    embassy_time::Timer::after(embassy_time::Duration::from_millis(10)).await;
+    embassy_time::Timer::after(embassy_time::Duration::from_millis(400)).await;
     nreset.set_high();
     info!("nreset now high!");
     let pending = core::future::pending();
