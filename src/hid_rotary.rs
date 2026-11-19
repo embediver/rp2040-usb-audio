@@ -1,20 +1,15 @@
 use embassy_futures::select::{Either, Either3, select, select3};
-use embassy_rp::{
-    Peri, bind_interrupts,
-    gpio::{AnyPin, Input},
-    peripherals::PIO1,
-    pio::Pio,
-};
+use embassy_rp::{Peri, bind_interrupts, gpio::Input, mode::Async, peripherals::PIO1, pio::Pio};
 use embassy_time::Delay;
-use embassy_usb::class::hid::{Config, HidWriter};
+use embassy_usb::class::hid::device::{Config, HidWriter};
 use embedded_hal_async::delay::DelayNs;
-use usbd_hid::descriptor::{MediaKey, MediaKeyboardReport, SerializedDescriptor};
+use usbd_hid::descriptor::{AsInputReport, MediaKey, MediaKeyboardReport, SerializedDescriptor};
 
 pub struct Inputs {
     rotary_a: Peri<'static, embassy_rp::peripherals::PIN_8>,
     rotary_b: Peri<'static, embassy_rp::peripherals::PIN_9>,
-    rotary_sw: Input<'static>,
-    button: Option<Input<'static>>,
+    rotary_sw: Input<'static, Async>,
+    button: Option<Input<'static, Async>>,
     pio: Peri<'static, embassy_rp::peripherals::PIO1>,
 }
 
@@ -29,15 +24,15 @@ impl Inputs {
     pub fn new(
         rotary_a: Peri<'static, embassy_rp::peripherals::PIN_8>,
         rotary_b: Peri<'static, embassy_rp::peripherals::PIN_9>,
-        rotary_sw: Peri<'static, embassy_rp::peripherals::PIN_10>,
-        button: Option<Peri<'static, AnyPin>>,
+        rotary_sw: Input<'static, Async>,
+        button: Option<Input<'static, Async>>,
         pio1: Peri<'static, PIO1>,
     ) -> Inputs {
         let inp = Inputs {
             rotary_a,
             rotary_b,
-            rotary_sw: Input::new(rotary_sw, embassy_rp::gpio::Pull::None),
-            button: button.map(|b| Input::new(b, embassy_rp::gpio::Pull::None)),
+            rotary_sw,
+            button,
             pio: pio1,
         };
         inp
@@ -69,6 +64,8 @@ pub async fn hid_task(inputs: Inputs, mut hid_writer: RpHidWriter) -> ! {
 
     hid_writer.ready().await;
 
+    let mut report = [0; 4];
+
     let mut rotary_sw = inputs.rotary_sw;
     let mut button = inputs.button;
     rotary_sw.set_schmitt(true);
@@ -79,7 +76,7 @@ pub async fn hid_task(inputs: Inputs, mut hid_writer: RpHidWriter) -> ! {
     let Pio {
         mut common, sm0, ..
     } = Pio::new(inputs.pio, PioIrqs);
-    let rot_prog = PioEncoderProgram::new(&mut common);
+    let rot_prog = PioEncoderProgram::new(&mut common, true);
     let mut rot_pio = PioEncoder::new(
         &mut common,
         sm0,
@@ -104,50 +101,40 @@ pub async fn hid_task(inputs: Inputs, mut hid_writer: RpHidWriter) -> ! {
 
         if let Some(Direction::Clockwise) = rotary {
             info!("Rotary CW");
-            hid_writer.write_serialize(&VOL_UP_REPORT).await.unwrap();
+            let len = VOL_UP_REPORT.serialize(&mut report).unwrap();
+            hid_writer.write(&report[..len]).await.unwrap();
             Delay.delay_ms(10).await;
-            hid_writer
-                .write_serialize(&NO_MEDIA_KEY_PRESSED)
-                .await
-                .unwrap();
+            let len = NO_MEDIA_KEY_PRESSED.serialize(&mut report).unwrap();
+            hid_writer.write(&report[..len]).await.unwrap();
         }
         if let Some(Direction::CounterClockwise) = rotary {
             info!("Rotary CCW");
-            hid_writer.write_serialize(&VOL_DOWN_REPORT).await.unwrap();
+            let len = VOL_DOWN_REPORT.serialize(&mut report).unwrap();
+            hid_writer.write(&report[..len]).await.unwrap();
             Delay.delay_ms(10).await;
-            hid_writer
-                .write_serialize(&NO_MEDIA_KEY_PRESSED)
-                .await
-                .unwrap();
+            let len = NO_MEDIA_KEY_PRESSED.serialize(&mut report).unwrap();
+            hid_writer.write(&report[..len]).await.unwrap();
         }
 
         if sw {
             info!("Rotary SW pressed");
-            hid_writer
-                .write_serialize(&PLAY_PAUSE_REPORT)
-                .await
-                .unwrap();
+            let len = PLAY_PAUSE_REPORT.serialize(&mut report).unwrap();
+            hid_writer.write(&report[..len]).await.unwrap();
             rotary_sw.wait_for_high().await;
             info!("Rotary SW released");
-            hid_writer
-                .write_serialize(&NO_MEDIA_KEY_PRESSED)
-                .await
-                .unwrap();
+            let len = NO_MEDIA_KEY_PRESSED.serialize(&mut report).unwrap();
+            hid_writer.write(&report[..len]).await.unwrap();
             Delay.delay_ms(100).await;
         }
 
         if btn_event {
             info!("Button pressed");
-            hid_writer
-                .write_serialize(&NEXT_TRACK_REPORT)
-                .await
-                .unwrap();
+            let len = NEXT_TRACK_REPORT.serialize(&mut report).unwrap();
+            hid_writer.write(&report[..len]).await.unwrap();
             rotary_sw.wait_for_high().await;
             info!("Button released");
-            hid_writer
-                .write_serialize(&NO_MEDIA_KEY_PRESSED)
-                .await
-                .unwrap();
+            let len = NO_MEDIA_KEY_PRESSED.serialize(&mut report).unwrap();
+            hid_writer.write(&report[..len]).await.unwrap();
             Delay.delay_ms(100).await;
         }
     }
@@ -159,5 +146,7 @@ pub fn hid_config() -> Config<'static> {
         request_handler: None,
         poll_ms: 60,
         max_packet_size: 64,
+        hid_subclass: embassy_usb::class::hid::HidSubclass::No,
+        hid_boot_protocol: embassy_usb::class::hid::HidBootProtocol::None,
     }
 }
