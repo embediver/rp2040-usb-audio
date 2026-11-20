@@ -58,9 +58,9 @@ const LUT_100DB: [u32; 101] = lut_100!();
 
 /// Maximum USB PCM Packet/Frame size (in bytes)
 ///
-/// 24bit (3 Byte) * 2samples (left/right) * 96kHz * 1ms (packet/frame interval) + 24bit * 6samples
+/// 24bit (3 Byte) * 2samples (left/right) * 96kHz * 1ms (packet/frame interval) + 24bit * 48samples
 ///
-/// 6sample (3left, 3right) extra to account for sync mismatch compensation.
+/// 48sample (24left, 24right) extra to account for sync mismatch compensation.
 const MAX_PACKET_SIZE: usize = (3 * 2) * (96000 / 1000) + (3 * 6);
 
 /// u32 DMA buffer size
@@ -144,9 +144,9 @@ async fn main(spawner: Spawner) -> ! {
         sample_width: SampleWidth::Width3Byte,
         channels: &[Channel::LeftFront, Channel::RightFront],
         feature_unit: Vec::from_array([
-            FeatureUnitControls::all(), // master
-            FeatureUnitControls::all(), // left
-            FeatureUnitControls::all(), // right
+            FeatureUnitControls::all(),   // master
+            FeatureUnitControls::empty(), // left
+            FeatureUnitControls::empty(), // right
         ]),
         max_packet_size: MAX_PACKET_SIZE as u16,
         feedback_refresh_period: FEEDBACK_RATE,
@@ -293,6 +293,7 @@ async fn audio_processor(
             24,
             &program,
         );
+        i2s.start();
         info!("I2S set-up to {}Hz", current_rate);
 
         let mut leftover_bytes = 0;
