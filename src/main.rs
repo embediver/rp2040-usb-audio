@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::AtomicBool;
 use core::{mem, sync::atomic::AtomicU8};
 
 use defmt::info;
@@ -202,6 +203,7 @@ async fn main(spawner: Spawner) -> ! {
     audio_stream.wait_connection().await;
 
     static VOLUME: AtomicU8 = AtomicU8::new(0);
+    static MUTED: AtomicBool = AtomicBool::new(false);
     static SAMPLE_RATE: watch::Watch<ThreadModeRawMutex, u32, 2> = watch::Watch::new();
     static SYNCH_FEEDBACK: Signal<ThreadModeRawMutex, Duration> = Signal::new();
 
@@ -222,6 +224,7 @@ async fn main(spawner: Spawner) -> ! {
         audio_processor(
             audio_stream,
             &VOLUME,
+            &MUTED,
             SAMPLE_RATE.dyn_receiver().unwrap(),
             &SYNCH_FEEDBACK,
             i2s_peri,
@@ -236,10 +239,14 @@ async fn main(spawner: Spawner) -> ! {
         let volume = audio_ctrl.volume(Channel::LeftFront);
         let rate = audio_ctrl.sample_rate_hz();
         match volume {
-            Some(Volume::Muted) => info!("Speaker is muted"),
+            Some(Volume::Muted) => {
+                info!("Speaker is muted");
+                MUTED.store(true, core::sync::atomic::Ordering::Relaxed);
+            }
             Some(Volume::DeciBel(db)) => {
                 info!("Volume is {}dB", db);
                 VOLUME.store(db.abs() as u8, core::sync::atomic::Ordering::Relaxed);
+                MUTED.store(false, core::sync::atomic::Ordering::Relaxed);
             }
             None => (),
         }
@@ -255,6 +262,7 @@ async fn main(spawner: Spawner) -> ! {
 async fn audio_processor(
     mut stream: Stream<'static, Driver<'static, USB>>,
     volume: &'static AtomicU8,
+    muted: &'static AtomicBool,
     mut sample_rate: watch::DynReceiver<'static, u32>,
     synch_feedback: &'static Signal<ThreadModeRawMutex, Duration>,
     mut i2s_peri: I2SPeripherals,
@@ -311,7 +319,7 @@ async fn audio_processor(
 
             let dma_future = i2s.write(&front_buffer[..next_buf_size]);
             let i2s_start_time = Instant::now();
-            if data_good {
+            if data_good && !muted.load(core::sync::atomic::Ordering::Relaxed) {
                 // In case of good data, unmute after transfer is started
                 if not_mute.is_set_low() {
                     info!("Unmute");
@@ -320,6 +328,8 @@ async fn audio_processor(
                     p.set_high();
                 }
                 not_mute.set_high();
+            } else {
+                not_mute.set_low();
             }
 
             let watch_dog_timer =
