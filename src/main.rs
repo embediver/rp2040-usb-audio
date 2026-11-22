@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::AtomicBool;
 use core::{mem, sync::atomic::AtomicU8};
 
 use defmt::info;
@@ -9,12 +10,13 @@ use embassy_executor::Spawner;
 use embassy_rp::gpio::Output;
 use embassy_rp::{
     Peri, bind_interrupts,
-    peripherals::{PIO0, USB},
+    peripherals::{DMA_CH0, PIO0, USB},
     pio::Pio,
     pio_programs::i2s::{PioI2sOut, PioI2sOutProgram},
     usb::{self, Driver},
 };
 use embassy_time::{Duration, Instant};
+use embassy_usb::class::uac::device::source::FeatureUnitControls;
 #[cfg(feature = "panic_probe")]
 use panic_probe as _;
 use static_cell::StaticCell;
@@ -23,15 +25,17 @@ use embassy_sync::signal::Signal;
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, watch};
 use embassy_usb::{
     Builder, Config,
-    class::uac1::speaker::{Feedback, Stream},
+    class::uac::device::speaker::{Feedback, Stream},
 };
 use embassy_usb::{
     UsbDevice,
-    class::uac1::{
+    class::uac::device::{
         Channel, FeedbackRefresh, SampleWidth,
-        speaker::{Speaker, State, Volume},
+        speaker::{Config as SpeakerConfig, Speaker, State, Volume},
     },
 };
+
+use heapless::Vec;
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 #[cfg(feature = "lut_based_volume")]
@@ -55,9 +59,9 @@ const LUT_100DB: [u32; 101] = lut_100!();
 
 /// Maximum USB PCM Packet/Frame size (in bytes)
 ///
-/// 24bit (3 Byte) * 2samples (left/right) * 96kHz * 1ms (packet/frame interval) + 24bit * 6samples
+/// 24bit (3 Byte) * 2samples (left/right) * 96kHz * 1ms (packet/frame interval) + 24bit * 48samples
 ///
-/// 6sample (3left, 3right) extra to account for sync mismatch compensation.
+/// 48sample (24left, 24right) extra to account for sync mismatch compensation.
 const MAX_PACKET_SIZE: usize = (3 * 2) * (96000 / 1000) + (3 * 6);
 
 /// u32 DMA buffer size
@@ -81,6 +85,9 @@ bind_interrupts!(struct UsbIrqs {
 
 bind_interrupts!(struct PioIrqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
+});
+bind_interrupts!(struct DmaIrqs {
+    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<DMA_CH0>;
 });
 
 // Pinout: GP0, GP1, GND, GP2, .., GP5, GND, GP6, GP7, GP8
@@ -133,21 +140,43 @@ async fn main(spawner: Spawner) -> ! {
         )
     };
 
-    let (mut audio_stream, mut feedback, audio_ctrl) = Speaker::new(
+    let speaker_config = SpeakerConfig {
+        sample_rates_hz: &SUPPORTED_SAMPLE_RATES,
+        sample_width: SampleWidth::Width3Byte,
+        channels: &[Channel::LeftFront, Channel::RightFront],
+        feature_unit: Vec::from_array([
+            FeatureUnitControls::all(),   // master
+            FeatureUnitControls::empty(), // left
+            FeatureUnitControls::empty(), // right
+        ]),
+        max_packet_size: MAX_PACKET_SIZE as u16,
+        feedback_refresh_period: FEEDBACK_RATE,
+    };
+    let Speaker {
+        stream,
+        mut feedback,
+        control_monitor,
+    } = Speaker::new(
         &mut usb_builder,
         UAC_STATE.init(State::new()),
-        MAX_PACKET_SIZE as u16,
-        SampleWidth::Width3Byte,
-        &SUPPORTED_SAMPLE_RATES,
-        &[Channel::LeftFront, Channel::RightFront],
-        FEEDBACK_RATE,
+        speaker_config,
     );
+    let mut audio_stream = stream;
+    let audio_ctrl = control_monitor;
 
     #[cfg(feature = "hid")]
     {
-        use embassy_usb::class::hid::{HidWriter, State};
+        use embassy_rp::{
+            gpio::{self, Input, Pull},
+            peripherals,
+        };
+        use embassy_usb::class::hid::device::{HidWriter, State};
 
         static HID_STATE: StaticCell<State> = StaticCell::new();
+
+        bind_interrupts!(struct GpioIrqs {
+            IO_IRQ_BANK0 => gpio::InterruptHandler<peripherals::PIN_10>, gpio::InterruptHandler<peripherals::PIN_11>;
+        });
 
         let hid: hid::RpHidWriter = HidWriter::new(
             &mut usb_builder,
@@ -155,40 +184,54 @@ async fn main(spawner: Spawner) -> ! {
             crate::hid::hid_config(),
         );
 
-        let inputs = hid::Inputs::new(p.PIN_8, p.PIN_9, p.PIN_10, Some(p.PIN_11.into()), p.PIO1);
+        let inputs = hid::Inputs::new(
+            p.PIN_8,
+            p.PIN_9,
+            Input::new_async(p.PIN_10, GpioIrqs, Pull::None),
+            Some(Input::new_async(p.PIN_11, GpioIrqs, Pull::None)),
+            p.PIO1,
+        );
 
-        spawner.must_spawn(hid::hid_task(inputs, hid));
+        spawner.spawn(hid::hid_task(inputs, hid).unwrap());
     }
 
     let usb = usb_builder.build();
 
-    spawner.must_spawn(usb_task(usb));
+    spawner.spawn(usb_task(usb).unwrap());
 
     feedback.wait_connection().await;
     audio_stream.wait_connection().await;
 
     static VOLUME: AtomicU8 = AtomicU8::new(0);
+    static MUTED: AtomicBool = AtomicBool::new(false);
     static SAMPLE_RATE: watch::Watch<ThreadModeRawMutex, u32, 2> = watch::Watch::new();
     static SYNCH_FEEDBACK: Signal<ThreadModeRawMutex, Duration> = Signal::new();
 
-    spawner.must_spawn(feedback_task(
-        feedback,
-        &SYNCH_FEEDBACK,
-        SAMPLE_RATE.dyn_receiver().unwrap(),
-    ));
+    spawner.spawn(
+        feedback_task(
+            feedback,
+            &SYNCH_FEEDBACK,
+            SAMPLE_RATE.dyn_receiver().unwrap(),
+        )
+        .unwrap(),
+    );
 
     #[cfg(feature = "power_control")]
     let amp_power = Some(amp_power);
     #[cfg(not(feature = "power_control"))]
     let amp_power = None;
-    spawner.must_spawn(audio_processor(
-        audio_stream,
-        &VOLUME,
-        SAMPLE_RATE.dyn_receiver().unwrap(),
-        &SYNCH_FEEDBACK,
-        i2s_peri,
-        amp_power,
-    ));
+    spawner.spawn(
+        audio_processor(
+            audio_stream,
+            &VOLUME,
+            &MUTED,
+            SAMPLE_RATE.dyn_receiver().unwrap(),
+            &SYNCH_FEEDBACK,
+            i2s_peri,
+            amp_power,
+        )
+        .unwrap(),
+    );
 
     let mut old_rate = 0;
     loop {
@@ -196,10 +239,14 @@ async fn main(spawner: Spawner) -> ! {
         let volume = audio_ctrl.volume(Channel::LeftFront);
         let rate = audio_ctrl.sample_rate_hz();
         match volume {
-            Some(Volume::Muted) => info!("Speaker is muted"),
+            Some(Volume::Muted) => {
+                info!("Speaker is muted");
+                MUTED.store(true, core::sync::atomic::Ordering::Relaxed);
+            }
             Some(Volume::DeciBel(db)) => {
                 info!("Volume is {}dB", db);
                 VOLUME.store(db.abs() as u8, core::sync::atomic::Ordering::Relaxed);
+                MUTED.store(false, core::sync::atomic::Ordering::Relaxed);
             }
             None => (),
         }
@@ -215,6 +262,7 @@ async fn main(spawner: Spawner) -> ! {
 async fn audio_processor(
     mut stream: Stream<'static, Driver<'static, USB>>,
     volume: &'static AtomicU8,
+    muted: &'static AtomicBool,
     mut sample_rate: watch::DynReceiver<'static, u32>,
     synch_feedback: &'static Signal<ThreadModeRawMutex, Duration>,
     mut i2s_peri: I2SPeripherals,
@@ -245,6 +293,7 @@ async fn audio_processor(
             &mut common,
             sm0,
             i2s_peri.dma_channel.reborrow(),
+            DmaIrqs,
             i2s_peri.data_pin.reborrow(),
             i2s_peri.bit_clock_pin.reborrow(),
             i2s_peri.left_right_clock_pin.reborrow(),
@@ -252,6 +301,7 @@ async fn audio_processor(
             24,
             &program,
         );
+        i2s.start();
         info!("I2S set-up to {}Hz", current_rate);
 
         let mut leftover_bytes = 0;
@@ -269,7 +319,7 @@ async fn audio_processor(
 
             let dma_future = i2s.write(&front_buffer[..next_buf_size]);
             let i2s_start_time = Instant::now();
-            if data_good {
+            if data_good && !muted.load(core::sync::atomic::Ordering::Relaxed) {
                 // In case of good data, unmute after transfer is started
                 if not_mute.is_set_low() {
                     info!("Unmute");
@@ -278,6 +328,8 @@ async fn audio_processor(
                     p.set_high();
                 }
                 not_mute.set_high();
+            } else {
+                not_mute.set_low();
             }
 
             let watch_dog_timer =
@@ -500,7 +552,7 @@ const fn samples_p_us(sample_rate_hz: f64) -> f64 {
 fn create_usb_conf(flash: Peri<'static, embassy_rp::peripherals::FLASH>) -> Config<'static> {
     use embassy_rp::flash::Flash;
     use embassy_sync::once_lock::OnceLock;
-    let mut flash: Flash<'_, _, _, 0> = Flash::new_blocking(flash);
+    let mut flash: Flash<'_, _, 0> = Flash::new_blocking(flash);
     let mut serial = [0; 16];
     let serial_ok = flash.blocking_unique_id(&mut serial).is_ok();
     static SERIAL_STR_BUF: OnceLock<[u8; 8]> = OnceLock::new();
