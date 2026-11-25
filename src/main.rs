@@ -6,7 +6,7 @@ use core::{mem, sync::atomic::AtomicU8};
 use defmt::info;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_rp::gpio::Output;
+use embassy_rp::gpio::{Level, Output};
 use embassy_rp::{
     Peri, bind_interrupts,
     peripherals::{PIO0, USB},
@@ -33,7 +33,6 @@ use embassy_usb::{
     },
 };
 
-use byteorder::{BigEndian, ByteOrder, LittleEndian};
 #[cfg(feature = "lut_based_volume")]
 use proc_lut::lut_100;
 
@@ -60,10 +59,24 @@ const LUT_100DB: [u32; 101] = lut_100!();
 /// 6sample (3left, 3right) extra to account for sync mismatch compensation.
 const MAX_PACKET_SIZE: usize = (3 * 2) * (96000 / 1000) + (3 * 6);
 
+/// Size of the incoming byte buffer
+///
+/// A full packet plus some leftover bytes from the previous packet. If the read buffer
+/// is smaller than a packet, the rp2040 usb driver returns `BufferOverflow` without re-arming
+/// the endpoint, after which every following read fails and audio stays dead.
+const IN_BUF_SIZE: usize = MAX_PACKET_SIZE + 12;
+
+/// I2S slot width in bits
+///
+/// The PCM5102A (clocked from BCK by its internal PLL, no MCLK) only supports 32fs or 64fs
+/// bit clocks. 2x24bit slots (48fs) happen to work at 48kHz but not at 96kHz, so 24bit
+/// samples are sent MSB aligned in 32bit slots (64fs).
+const I2S_SLOT_BITS: u32 = 32;
+
 /// u32 DMA buffer size
 ///
-/// Two times the size to hold a single frame.
-const DMA_BUFFER_SIZE: usize = MAX_PACKET_SIZE / 4 * 2;
+/// Two times the size to hold the processed data of one packet (one u32 per 3 byte sample).
+const DMA_BUFFER_SIZE: usize = IN_BUF_SIZE / 3 * 2;
 
 /// Synch feedback every x packets
 const FEEDBACK_RATE: FeedbackRefresh = FeedbackRefresh::Period32Frames;
@@ -74,6 +87,19 @@ const SUPPORTED_SAMPLE_RATES: [u32; 3] = [44100, 48000, 96000];
 
 /// Timeout after which the DAC gets muted when no data arrived
 const PACKET_TIMEOUT_US: u64 = 900;
+
+/// Reset the chip on a sample rate change instead of only restarting I2S
+///
+/// The PCM5102A stays silent after a sample rate change at runtime, while every sample rate
+/// works when it is set on startup.
+const RESET_ON_RATE_CHANGE: bool = true;
+
+/// Time the I2S clocks are stopped on a sample rate change, so the DAC re-detects the rate
+/// (only used when `RESET_ON_RATE_CHANGE` is disabled)
+const DAC_CLOCK_HALT: Duration = Duration::from_millis(500);
+
+/// Time without any audio packets after which the amplifier power gets switched off
+const AMP_POWER_OFF_DELAY: Duration = Duration::from_secs(5);
 
 bind_interrupts!(struct UsbIrqs {
     USBCTRL_IRQ => usb::InterruptHandler<embassy_rp::peripherals::USB>;
@@ -226,7 +252,7 @@ async fn audio_processor(
     stream.wait_connection().await;
     let mut current_rate = sample_rate.get().await;
 
-    let mut in_buf = [0; MAX_PACKET_SIZE];
+    let mut in_buf = [0; IN_BUF_SIZE];
 
     // create two audio buffers (back and front) which will take turns being
     // filled with new audio data and being sent to the pio fifo using dma
@@ -234,7 +260,29 @@ async fn audio_processor(
     let dma_buffer = DMA_BUFFER.init_with(|| [0u32; DMA_BUFFER_SIZE]);
     let (mut back_buffer, mut front_buffer) = dma_buffer.split_at_mut(DMA_BUFFER_SIZE / 2);
 
+    let mut restart = false;
     loop {
+        if restart {
+            // Stop BCK/LRCK for a while before restarting with a new sample rate, so the
+            // restart looks like a fresh power-up to the PCM5102A. Without a clean clock halt
+            // it doesn't pick up the new rate and stays silent.
+            //
+            // The lines have to be actively driven low: `make_pio_pin` disables the pad pulls,
+            // so after the PIO got dropped they would float and the DAC would see noise
+            // instead of stopped clocks.
+            //
+            // The amp power is switched off as well and switched on again with the first
+            // good packet, when the I2S clocks are already running (same as after boot).
+            if let Some(ref mut p) = amp_power {
+                p.set_low();
+            }
+            let _bck = Output::new(i2s_peri.bit_clock_pin.reborrow(), Level::Low);
+            let _lrck = Output::new(i2s_peri.left_right_clock_pin.reborrow(), Level::Low);
+            let _data = Output::new(i2s_peri.data_pin.reborrow(), Level::Low);
+            embassy_time::Timer::after(DAC_CLOCK_HALT).await;
+        }
+        restart = true;
+
         // Setup pio state machine for i2s output
         let Pio {
             mut common, sm0, ..
@@ -249,12 +297,18 @@ async fn audio_processor(
             i2s_peri.bit_clock_pin.reborrow(),
             i2s_peri.left_right_clock_pin.reborrow(),
             current_rate,
-            24,
+            I2S_SLOT_BITS,
             &program,
         );
         info!("I2S set-up to {}Hz", current_rate);
 
         let mut leftover_bytes = 0;
+        let mut malformed_packets = 0u32;
+        let mut last_packet_time = Instant::now();
+        #[cfg(feature = "panic_probe")]
+        let mut recent_packet_lengths = [0u16; 16];
+        #[cfg(feature = "panic_probe")]
+        let mut recent_packet_count = 0usize;
 
         // process audio data until sample-rate changes
         let mut next_buf_size = 0;
@@ -262,8 +316,21 @@ async fn audio_processor(
         'inner: loop {
             if let Some(rate) = sample_rate.try_changed() {
                 current_rate = rate;
-                info!("Sample rate changed to {}Hz, restarting I2S...", rate);
                 not_mute.set_low();
+                if RESET_ON_RATE_CHANGE {
+                    // The PCM5102A reliably picks up a sample rate only on a fresh start;
+                    // restarting the I2S clocks (even with a clock halt) leaves it silent.
+                    // Reset the whole chip instead: the host re-enumerates the device and
+                    // sets the selected sample rate again right away.
+                    info!("Sample rate changed to {}Hz, resetting...", rate);
+                    if let Some(ref mut p) = amp_power {
+                        p.set_low();
+                    }
+                    // let the soft mute ramp (104 samples) finish before the reset
+                    embassy_time::Timer::after(Duration::from_millis(10)).await;
+                    cortex_m::peripheral::SCB::sys_reset();
+                }
+                info!("Sample rate changed to {}Hz, restarting I2S...", rate);
                 break 'inner;
             }
 
@@ -282,8 +349,26 @@ async fn audio_processor(
 
             let watch_dog_timer =
                 embassy_time::Timer::after(Duration::from_micros(PACKET_TIMEOUT_US));
+            #[cfg(feature = "panic_probe")]
+            let packet_read = async {
+                use core::future::{Future, poll_fn};
+
+                let mut read = core::pin::pin!(stream.read_packet(&mut in_buf[leftover_bytes..]));
+                poll_fn(|context| {
+                    let endpoint = embassy_rp::pac::USB_DPRAM.ep_out_control(0).read().0;
+                    let buffer = embassy_rp::pac::USB_DPRAM.ep_out_buffer_control(1).read().0;
+                    read.as_mut()
+                        .poll(context)
+                        .map(|result| (result, endpoint, buffer))
+                })
+                .await
+            };
+            #[cfg(not(feature = "panic_probe"))]
+            let packet_read = async {
+                (stream.read_packet(&mut in_buf[leftover_bytes..]).await, 0u32, 0u32)
+            };
             let packet_result = match embassy_futures::select::select(
-                stream.read_packet(&mut in_buf[leftover_bytes..]),
+                packet_read,
                 watch_dog_timer,
             )
             .await
@@ -297,13 +382,22 @@ async fn audio_processor(
                     not_mute.set_low();
                     dma_future.await;
 
-                    if let Some(ref mut p) = amp_power {
-                        p.set_low();
+                    // Only cut amp power after a longer pause. Single missed packets happen
+                    // under host load (e.g. gaming) and power-cycling the amp makes a short
+                    // hiccup a long dropout.
+                    if last_packet_time.elapsed() > AMP_POWER_OFF_DELAY {
+                        if let Some(ref mut p) = amp_power {
+                            if p.is_set_high() {
+                                info!("Amp power off (idle)");
+                            }
+                            p.set_low();
+                        }
                     }
 
                     continue 'inner;
                 }
             };
+            let (packet_result, _endpoint_status, _buffer_status) = packet_result;
             let mut n_bytes = match packet_result {
                 Ok(n) => n,
                 Err(e) => {
@@ -327,12 +421,51 @@ async fn audio_processor(
             if n_bytes % 6 == 0 {
                 // Data good
                 data_good = true;
+                #[cfg(feature = "panic_probe")]
+                {
+                    recent_packet_lengths[recent_packet_count % recent_packet_lengths.len()] =
+                        n_bytes as u16;
+                    recent_packet_count = recent_packet_count.wrapping_add(1);
+                }
             } else {
                 // Funny amount of bytes received
-                not_mute.set_low(); // instantly mute
-                // data_good = false;
-                panic!("malformed packet (received {} bytes)", n_bytes);
+                #[cfg(feature = "panic_probe")]
+                {
+                    let count = recent_packet_count.min(recent_packet_lengths.len());
+                    let mut ordered = recent_packet_lengths;
+                    if recent_packet_count >= recent_packet_lengths.len() {
+                        ordered.rotate_left(recent_packet_count % recent_packet_lengths.len());
+                    }
+                    defmt::error!(
+                        "Last packet lengths (oldest first): {:?}",
+                        &ordered[..count]
+                    );
+                    defmt::error!(
+                        "Audio OUT EP1 before read poll: enabled={}, full={}, available={}, register length={}, received={}, leftover={}, sample rate={}",
+                        _endpoint_status & 0x8000_0000 != 0,
+                        _buffer_status & 0x8000 != 0,
+                        _buffer_status & 0x0400 != 0,
+                        _buffer_status & 0x03ff,
+                        n_bytes,
+                        leftover_bytes,
+                        current_rate,
+                    );
+                }
+                // Isochronous transfers have no retries, so a corrupted/truncated packet
+                // can always happen (busy bus, bit errors, hubs). Don't panic/reset for that:
+                // replace the packet with silence of (roughly) the same length so the I2S
+                // stream and the sync feedback keep running. A 1ms gap is barely audible,
+                // a reset and re-enumeration is not.
+                malformed_packets = malformed_packets.wrapping_add(1);
+                defmt::warn!(
+                    "Malformed packet ({} bytes), replacing with silence ({} so far)",
+                    n_bytes,
+                    malformed_packets
+                );
+                n_bytes -= n_bytes % 6;
+                in_buf[leftover_bytes..leftover_bytes + n_bytes].fill(0);
             }
+            last_packet_time = Instant::now();
 
             let usb_packet_delay = i2s_start_time.elapsed();
             synch_feedback.signal(usb_packet_delay);
@@ -348,10 +481,9 @@ async fn audio_processor(
             // 2. Calculate how many bytes will be left over again.
             // 3. Create a slice which holds all the bytes we wan't to process and send out in this pass
             n_bytes += leftover_bytes;
-            leftover_bytes = n_bytes % 12; // 12 = least common multiple of 3 (one sample) and 4 (one dma buffer value)
+            leftover_bytes = n_bytes % 6; // 6 = one stereo frame (2 * 24bit)
             let work_slice_size = n_bytes - leftover_bytes;
-            assert_eq!(work_slice_size % 4, 0);
-            let work_slice = &mut in_buf[..work_slice_size];
+            let work_slice = &in_buf[..work_slice_size];
 
             // info!(
             //     "Working with {} bytes ({} samples)",
@@ -359,16 +491,12 @@ async fn audio_processor(
             //     work_slice_size / 3
             // );
 
-            let vol = volume.load(core::sync::atomic::Ordering::Relaxed);
-            convert_and_attenuate_buf(work_slice, vol);
-
             // Incoming PCM data is little endian
             // b0:lo_L, b1:mid_L, b2:hi_L, b3:lo_R, b4:mid_R, b5:hi_R
-            // I2S demands big endian data
-            // The individual samples were already stored in the right format in the volume application step,
-            // so we just copy from u8 slice to u32 slice in big endian format
-            next_buf_size = work_slice_size / 4;
-            BigEndian::read_u32_into(work_slice, &mut back_buffer[..next_buf_size]);
+            // I2S gets one MSB aligned u32 word per sample (32bit slots).
+            let vol = volume.load(core::sync::atomic::Ordering::Relaxed);
+            next_buf_size = work_slice_size / 3;
+            convert_and_attenuate_buf(work_slice, &mut back_buffer[..next_buf_size], vol);
 
             // Bytes have now been written to the outgoing buffer,
             // Copy any leftover bytes to the start of the incoming buffer.
@@ -407,10 +535,19 @@ async fn feedback_task(
 ) -> ! {
     let mut desired_spp = 48.;
     let mut prev_avg = 0;
+    let mut prev_rate = 0;
     loop {
         let sample_rate = sample_rate.get().await;
         // Nominal samples per packet
         let nominal_spp = sample_rate as f64 / 1000.0;
+
+        if sample_rate != prev_rate {
+            // Restart the control loop from the nominal value, otherwise e.g. 48 spp
+            // would still be reported after switching to 96kHz.
+            prev_rate = sample_rate;
+            desired_spp = nominal_spp;
+            prev_avg = 0;
+        }
 
         let mut values = [0; FEEDBACK_RATE.frame_count()];
         for val in &mut values {
@@ -464,6 +601,9 @@ async fn feedback_task(
         let d_us_pp = delta as f64 / FEEDBACK_RATE.frame_count() as f64;
         // desired samples per packet
         desired_spp += -0.3 * d_us_pp * samples_p_us(sample_rate as f64);
+        // Keep the feedback within one sample of nominal, so the host never sends
+        // more than fits into a packet and the control loop can't run away.
+        desired_spp = desired_spp.clamp(nominal_spp - 1.0, nominal_spp + 1.0);
         // info!("Desired samples per packet should thus be {}", desired_spp);
 
         write_feedback(&mut feedback, desired_spp).await;
@@ -520,48 +660,68 @@ fn create_usb_conf(flash: Peri<'static, embassy_rp::peripherals::FLASH>) -> Conf
     conf
 }
 
-/// Convert the buffer from 24bit PCM big- to little-endian and apply a attenuation
+/// Attenuate interleaved 24bit little endian PCM and convert it for the I2S DMA
 ///
-/// The volume (attenuation) has to be in dB from 0dB (no attenuation) to 100dB (maximum attenuation).
-#[inline]
-#[cfg(feature = "lut_based_volume")]
-fn convert_and_attenuate_buf(buf: &mut [u8], vol: u8) {
-    assert!(vol <= 100);
-    for i in (0..buf.len()).step_by(3) {
-        let mut sample = LittleEndian::read_i24(&buf[i..i + 3]);
-        if LUT_100DB[vol as usize] != 1 {
-            sample /= LUT_100DB[vol as usize] as i32;
-        }
-        BigEndian::write_i24(&mut buf[i..i + 3], sample);
+/// `input.len()` has to be a multiple of 3 and `output.len()` has to be `input.len() / 3`.
+/// Every sample becomes one MSB aligned u32 word (24bit sample in a 32bit I2S slot).
+///
+/// This runs once per USB packet in the audio path: at 96kHz there are 192 samples per
+/// millisecond on a Cortex-M0+.
+#[inline(never)]
+fn convert_and_attenuate_buf(input: &[u8], output: &mut [u32], vol: u8) {
+    debug_assert_eq!(input.len() % 3, 0);
+    debug_assert_eq!(input.len() / 3, output.len());
+    let attenuate = attenuation(vol);
+
+    for (inp, out) in input.chunks_exact(3).zip(output.iter_mut()) {
+        // little endian 24bit -> sign extended i32
+        let sample = i32::from_le_bytes([0, inp[0], inp[1], inp[2]]) >> 8;
+        *out = (attenuate(sample) as u32) << 8;
     }
 }
 
-/// Convert the buffer from 24bit PCM big- to little-endian and apply a attenuation
+/// Attenuation function for a volume (attenuation) in dB from 0dB (no attenuation) to 100dB
+/// (maximum attenuation).
 ///
-/// The volume (attenuation) has to be in dB from 0dB (no attenuation) to 192dB (maximum attenuation).
+/// The division uses the rp2040 hardware divider (embassy-rp `intrinsics` feature).
+#[inline(always)]
+#[cfg(feature = "lut_based_volume")]
+fn attenuation(vol: u8) -> impl Fn(i32) -> i32 {
+    let divisor = LUT_100DB[vol.min(100) as usize] as i32;
+    move |sample| {
+        if divisor == 1 {
+            sample
+        } else {
+            sample / divisor
+        }
+    }
+}
+
+/// Attenuation function for a volume (attenuation) in dB from 0dB (no attenuation) to 192dB
+/// (maximum attenuation).
+///
 /// Attenuation is applied in 3dB steps with shift operations.
-#[inline]
+#[inline(always)]
 #[cfg(not(feature = "lut_based_volume"))]
-fn convert_and_attenuate_buf(buf: &mut [u8], vol: u8) {
+fn attenuation(vol: u8) -> impl Fn(i32) -> i32 {
     assert!(vol <= 192);
 
     // 6dB attenuation equals a right shift of 1 (division by two)
     // By shifting a second time and substracting the result from the first operation,
     // a further 3dB attenuation can be archieved.
 
-    let steps_6db = vol / 6; // how many 6dB shifts to apply
+    let steps_6db = (vol / 6) as u32; // how many 6dB shifts to apply
     let step_3db = vol % 6 >= 3; // how many 3dB shifts to apply
 
-    for i in (0..buf.len()).step_by(3) {
-        let mut sample = LittleEndian::read_i24(&buf[i..i + 3]);
-        if vol >= 3 {
-            let mut tmp = sample >> steps_6db;
-            if step_3db {
-                tmp -= sample >> 2;
-            }
-            sample = tmp;
+    move |sample| {
+        if vol < 3 {
+            return sample;
         }
-        BigEndian::write_i24(&mut buf[i..i + 3], sample);
+        let mut tmp = sample >> steps_6db.min(31);
+        if step_3db {
+            tmp -= sample >> 2;
+        }
+        tmp
     }
 }
 
